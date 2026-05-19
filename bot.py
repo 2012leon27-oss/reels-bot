@@ -1,5 +1,4 @@
 # bot.py
-# Главный файл бота — точка входа
 
 import os
 import asyncio
@@ -14,55 +13,37 @@ from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, W
 
 from grok_client import ask_grok
 from database import (
-    init_db, save_user, save_message, 
+    init_db, save_user, save_message,
     get_history, clear_history, get_stats
 )
 from keep_alive import start_webserver
 
-# Загружаем переменные окружения
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
-
-# Ссылка на Mini App
 MINI_APP_URL = "https://seflev299-cmyk.github.io/reels-producer-ai/"
 
-# Логирование
 logging.basicConfig(level=logging.INFO, format="%(asctime)s — %(levelname)s — %(message)s")
 logger = logging.getLogger(__name__)
 
-# Инициализация бота
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 
-# ===== КЛАВИАТУРА С КНОПКОЙ MINI APP =====
-
 def get_mini_app_keyboard() -> InlineKeyboardMarkup:
-    """Создаёт клавиатуру с кнопкой открытия Mini App."""
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(
-                text="🥜 Открыть REELS PRODUCER",
-                web_app=WebAppInfo(url=MINI_APP_URL)
-            )
-        ]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🥜 Открыть REELS PRODUCER", web_app=WebAppInfo(url=MINI_APP_URL))]
     ])
-    return keyboard
 
-
-# ===== КОМАНДЫ =====
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    """Приветствие при /start."""
     await save_user(
         user_id=message.from_user.id,
         username=message.from_user.username or "",
         first_name=message.from_user.first_name or ""
     )
-    
     greeting = (
         "привет! я нейрокуратор курса <b>«Книга рецептов вкусного контента»</b> от Шеф Льва)\n\n"
         "я помогу тебе разобраться в материале, напомню нужный блок, помогу придумать идеи, "
@@ -83,7 +64,6 @@ async def cmd_start(message: Message):
 
 @dp.message(Command("app"))
 async def cmd_app(message: Message):
-    """Открыть Mini App."""
     await message.answer(
         "🥜 жми на кнопку, чтобы открыть <b>REELS PRODUCER.AI</b>",
         reply_markup=get_mini_app_keyboard()
@@ -92,7 +72,6 @@ async def cmd_app(message: Message):
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
-    """Помощь."""
     text = (
         "<b>что я умею:</b>\n\n"
         "🥩 объяснить любой блок курса\n"
@@ -112,17 +91,14 @@ async def cmd_help(message: Message):
 
 @dp.message(Command("reset"))
 async def cmd_reset(message: Message):
-    """Очистка истории диалога."""
     await clear_history(message.from_user.id)
     await message.answer("история очищена) начнём с чистого листа. о чём поговорим?")
 
 
 @dp.message(Command("stats"))
 async def cmd_stats(message: Message):
-    """Статистика — только для админа."""
     if message.from_user.id != ADMIN_ID:
         return
-    
     stats = await get_stats()
     text = (
         f"📊 <b>Статистика бота</b>\n\n"
@@ -133,47 +109,29 @@ async def cmd_stats(message: Message):
     await message.answer(text)
 
 
-# ===== ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ =====
-
 @dp.message(F.text)
 async def handle_message(message: Message):
-    """Обработка любого текстового сообщения через Grok."""
     user_id = message.from_user.id
     user_text = message.text
-    
-    # Сохраняем пользователя (обновляем last_active)
     await save_user(
         user_id=user_id,
         username=message.from_user.username or "",
         first_name=message.from_user.first_name or ""
     )
-    
-    # Показываем "печатает..."
     await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
-    
-    # Получаем историю диалога
     history = await get_history(user_id, limit=20)
-    
-    # Запрашиваем ответ у Grok
     answer = await ask_grok(user_text, history=history)
-    
-    # Сохраняем оба сообщения в историю
     await save_message(user_id, "user", user_text)
     await save_message(user_id, "assistant", answer)
-    
-    # Отправляем ответ
     try:
         await message.answer(answer)
     except Exception as e:
-        # Если HTML парсер ругается на спецсимволы — отправляем без форматирования
         logger.warning(f"Ошибка форматирования: {e}")
         await message.answer(answer, parse_mode=None)
 
 
-# Обработка не-текстовых сообщений (видео, фото)
 @dp.message(F.video | F.video_note | F.animation)
 async def handle_video(message: Message):
-    """Объясняем, что видео анализировать не умеем."""
     text = (
         "к сожалению, я не умею анализировать видео — нейросети пока реально плохо с этим справляются\n\n"
         "но я могу дать тебе полноценную обратную связь, если скинешь:\n\n"
@@ -187,7 +145,6 @@ async def handle_video(message: Message):
 
 @dp.message(F.photo)
 async def handle_photo(message: Message):
-    """Если кинули фото без текста."""
     text = (
         "вижу скриншот) опиши коротко — это кадр из твоего рилса? или что-то другое?\n\n"
         "если хочешь обратную связь — скинь ещё сценарий и описание раскадровки, "
@@ -196,132 +153,12 @@ async def handle_photo(message: Message):
     await message.answer(text)
 
 
-# ===== ЗАПУСК =====
-
 async def main():
-    """Точка входа."""
     logger.info("🚀 Запуск бота...")
-    
-    # Инициализируем БД
     await init_db()
-    
-    # Запускаем веб-сервер для Render (чтобы не засыпал)
     await start_webserver()
-    
-    # Удаляем старые апдейты и запускаем поллинг
     await bot.delete_webhook(drop_pending_updates=True)
     logger.info("✅ Бот запущен и готов к работе")
-    
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())    )
-    await message.answer(text)
-
-
-@dp.message(Command("reset"))
-async def cmd_reset(message: Message):
-    """Очистка истории диалога."""
-    await clear_history(message.from_user.id)
-    await message.answer("история очищена) начнём с чистого листа. о чём поговорим?")
-
-
-@dp.message(Command("stats"))
-async def cmd_stats(message: Message):
-    """Статистика — только для админа."""
-    if message.from_user.id != ADMIN_ID:
-        return
-    
-    stats = await get_stats()
-    text = (
-        f"📊 <b>Статистика бота</b>\n\n"
-        f"👥 Всего пользователей: <b>{stats['total_users']}</b>\n"
-        f"💬 Всего сообщений: <b>{stats['total_messages']}</b>\n"
-        f"🔥 Активны за сутки: <b>{stats['active_today']}</b>"
-    )
-    await message.answer(text)
-
-
-# ===== ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ =====
-
-@dp.message(F.text)
-async def handle_message(message: Message):
-    """Обработка любого текстового сообщения через Grok."""
-    user_id = message.from_user.id
-    user_text = message.text
-    
-    # Сохраняем пользователя (обновляем last_active)
-    await save_user(
-        user_id=user_id,
-        username=message.from_user.username or "",
-        first_name=message.from_user.first_name or ""
-    )
-    
-    # Показываем "печатает..."
-    await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
-    
-    # Получаем историю диалога
-    history = await get_history(user_id, limit=20)
-    
-    # Запрашиваем ответ у Grok
-    answer = await ask_grok(user_text, history=history)
-    
-    # Сохраняем оба сообщения в историю
-    await save_message(user_id, "user", user_text)
-    await save_message(user_id, "assistant", answer)
-    
-    # Отправляем ответ
-    try:
-        await message.answer(answer)
-    except Exception as e:
-        # Если HTML парсер ругается на спецсимволы — отправляем без форматирования
-        logger.warning(f"Ошибка форматирования: {e}")
-        await message.answer(answer, parse_mode=None)
-
-
-# Обработка не-текстовых сообщений (видео, фото)
-@dp.message(F.video | F.video_note | F.animation)
-async def handle_video(message: Message):
-    """Объясняем, что видео анализировать не умеем."""
-    text = (
-        "к сожалению, я не умею анализировать видео — нейросети пока реально плохо с этим справляются\n\n"
-        "но я могу дать тебе полноценную обратную связь, если скинешь:\n\n"
-        "1. <b>сценарий</b> — полный текст того, что ты говоришь в рилсе\n"
-        "2. <b>раскадровку</b> — какие кадры, ракурсы, композиции и в каком порядке\n"
-        "3. <b>скриншоты</b> — 3-5 кадров из разных моментов\n\n"
-        "чем больше из этого скинешь — тем точнее будет обратная связь)"
-    )
-    await message.answer(text)
-
-
-@dp.message(F.photo)
-async def handle_photo(message: Message):
-    """Если кинули фото без текста."""
-    text = (
-        "вижу скриншот) опиши коротко — это кадр из твоего рилса? или что-то другое?\n\n"
-        "если хочешь обратную связь — скинь ещё сценарий и описание раскадровки, "
-        "тогда смогу разобрать всё по полочкам"
-    )
-    await message.answer(text)
-
-
-# ===== ЗАПУСК =====
-
-async def main():
-    """Точка входа."""
-    logger.info("🚀 Запуск бота...")
-    
-    # Инициализируем БД
-    await init_db()
-    
-    # Запускаем веб-сервер для Render (чтобы не засыпал)
-    await start_webserver()
-    
-    # Удаляем старые апдейты и запускаем поллинг
-    await bot.delete_webhook(drop_pending_updates=True)
-    logger.info("✅ Бот запущен и готов к работе")
-    
     await dp.start_polling(bot)
 
 
