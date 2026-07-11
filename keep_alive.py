@@ -1,25 +1,33 @@
-# keep_alive.py
-# Веб-сервер-обманка, чтобы Render не засыпал (бесплатный план)
+"""Small health server used by hosting platforms such as Render."""
+
+from __future__ import annotations
+
+from collections.abc import Awaitable, Callable
 
 from aiohttp import web
 
-
-async def handle(request):
-    return web.Response(text="🤖 Бот Шеф Льва жив и работает!")
+HealthCheck = Callable[[], Awaitable[bool]]
 
 
-async def start_webserver():
-    """Запускаем веб-сервер для Render."""
-    import os
-    port = int(os.getenv("PORT", 10000))
-    
+async def start_webserver(port: int, health_check: HealthCheck) -> web.AppRunner:
+    async def root(_: web.Request) -> web.Response:
+        return web.json_response(
+            {"service": "telegram-business-assistant", "status": "running"}
+        )
+
+    async def health(_: web.Request) -> web.Response:
+        healthy = await health_check()
+        return web.json_response(
+            {"status": "ok" if healthy else "unhealthy"},
+            status=200 if healthy else 503,
+        )
+
     app = web.Application()
-    app.router.add_get("/", handle)
-    app.router.add_get("/health", handle)
-    
+    app.router.add_get("/", root)
+    app.router.add_get("/health", health)
+
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    
-    print(f"✅ Веб-сервер запущен на порту {port}")
+    return runner
