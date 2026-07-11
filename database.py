@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 from typing import Any
 
@@ -126,6 +127,7 @@ class Database:
         self.database_url = database_url
         self.pool: asyncpg.Pool | None = None
         self._instance_lock_connection: asyncpg.Connection | None = None
+        self._instance_lock_check = asyncio.Lock()
 
     def _pool(self) -> asyncpg.Pool:
         if self.pool is None:
@@ -179,8 +181,37 @@ class Database:
     async def ping(self) -> bool:
         try:
             return await self._pool().fetchval("SELECT TRUE")
-        except (asyncpg.PostgresError, RuntimeError):
+        except (
+            asyncpg.PostgresError,
+            asyncpg.InterfaceError,
+            RuntimeError,
+            OSError,
+        ):
             return False
+
+    async def instance_lock_healthy(self) -> bool:
+        if self._instance_lock_connection is None:
+            return False
+        async with self._instance_lock_check:
+            try:
+                return bool(
+                    await self._instance_lock_connection.fetchval(
+                        """
+                        SELECT EXISTS (
+                            SELECT 1
+                            FROM pg_locks
+                            WHERE locktype = 'advisory'
+                              AND pid = pg_backend_pid()
+                              AND granted
+                        )
+                        """
+                    )
+                )
+            except (asyncpg.PostgresError, asyncpg.InterfaceError, OSError):
+                return False
+
+    async def healthy(self) -> bool:
+        return await self.ping() and await self.instance_lock_healthy()
 
     async def upsert_connection(
         self,
@@ -475,6 +506,24 @@ class Database:
             is not None
         )
 
+    async def is_reply_reserved(
+        self, connection_id: str, chat_id: int, incoming_message_id: int
+    ) -> bool:
+        return bool(
+            await self._pool().fetchval(
+                """
+                SELECT reply_reserved_at IS NOT NULL
+                FROM business_messages
+                WHERE connection_id = $1
+                  AND chat_id = $2
+                  AND telegram_message_id = $3
+                """,
+                connection_id,
+                chat_id,
+                incoming_message_id,
+            )
+        )
+
     async def edit_message(
         self,
         connection_id: str,
@@ -624,7 +673,7 @@ class Database:
                   SELECT 1 FROM business_messages newer
                   WHERE newer.connection_id = $1
                     AND newer.chat_id = $2
-                    AND newer.role = 'owner'
+                    AND NOT newer.is_deleted
                     AND newer.id > current.id
               )
             ON CONFLICT (connection_id, chat_id, incoming_message_id) DO NOTHING
@@ -741,7 +790,7 @@ class Database:
                   FROM business_messages newer
                   WHERE newer.connection_id = p.connection_id
                     AND newer.chat_id = p.chat_id
-                    AND newer.role = 'owner'
+                    AND NOT newer.is_deleted
                     AND newer.id > incoming.id
               )
             RETURNING p.*
@@ -797,6 +846,20 @@ class Database:
                   p.processing_started_at IS NULL
                   OR p.processing_started_at < NOW() - INTERVAL '10 minutes'
               )
+              AND b.connection_id = p.connection_id
+              AND b.owner_user_id = $1
+            """,
+            owner_id,
+        )
+        return int(result.split()[-1])
+
+    async def recover_all_processing(self, owner_id: int) -> int:
+        result = await self._pool().execute(
+            """
+            UPDATE pending_reviews p
+            SET status = 'send_unknown', resolved_at = NOW()
+            FROM business_connections b
+            WHERE p.status = 'processing'
               AND b.connection_id = p.connection_id
               AND b.owner_user_id = $1
             """,

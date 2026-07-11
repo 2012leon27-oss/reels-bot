@@ -7,8 +7,9 @@ import html
 import logging
 from contextlib import suppress
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable, TypeVar
 
+import asyncpg
 from aiogram import Bot, Dispatcher, Router
 from aiogram.exceptions import (
     TelegramBadRequest,
@@ -39,6 +40,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+T = TypeVar("T")
 
 
 def message_text(message: Message) -> tuple[str, bool]:
@@ -96,6 +98,26 @@ class Assistant:
     def _is_owner(self, user_id: int | None) -> bool:
         return user_id == self.settings.owner_id
 
+    async def _retry_db(
+        self, label: str, operation: Callable[[], Awaitable[T]]
+    ) -> T:
+        delay = 1
+        while True:
+            try:
+                return await operation()
+            except asyncio.CancelledError:
+                raise
+            except (
+                asyncpg.PostgresError,
+                asyncpg.InterfaceError,
+                ConnectionError,
+                OSError,
+                TimeoutError,
+            ):
+                logger.exception("%s failed; retrying durable persistence", label)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 30)
+
     async def _save_connection(self, connection: BusinessConnection) -> bool:
         if connection.user.id != self.settings.owner_id:
             logger.warning(
@@ -105,30 +127,51 @@ class Assistant:
             )
             return False
         rights = connection.rights
-        await self.db.upsert_connection(
-            connection_id=connection.id,
-            owner_user_id=connection.user.id,
-            owner_chat_id=connection.user_chat_id,
-            is_enabled=connection.is_enabled,
-            can_reply=bool(rights and rights.can_reply),
-            can_read_messages=bool(rights and rights.can_read_messages),
+        await self._retry_db(
+            "saving business connection",
+            lambda: self.db.upsert_connection(
+                connection_id=connection.id,
+                owner_user_id=connection.user.id,
+                owner_chat_id=connection.user_chat_id,
+                is_enabled=connection.is_enabled,
+                can_reply=bool(rights and rights.can_reply),
+                can_read_messages=bool(rights and rights.can_read_messages),
+            ),
         )
         return True
 
     async def _ensure_connection(self, connection_id: str) -> dict[str, Any] | None:
-        stored = await self.db.get_connection(connection_id)
+        stored = await self._retry_db(
+            "loading business connection",
+            lambda: self.db.get_connection(connection_id),
+        )
         if stored:
             return stored
-        try:
-            remote = await self.bot.get_business_connection(
-                business_connection_id=connection_id
-            )
-        except Exception:
-            logger.exception("Could not fetch business connection %s", connection_id)
-            return None
+        delay = 1
+        while True:
+            try:
+                remote = await self.bot.get_business_connection(
+                    business_connection_id=connection_id
+                )
+                break
+            except (TelegramBadRequest, TelegramForbiddenError, TelegramNotFound):
+                logger.exception("Business connection %s is invalid", connection_id)
+                return None
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Could not fetch business connection %s; retrying",
+                    connection_id,
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 30)
         if not await self._save_connection(remote):
             return None
-        return await self.db.get_connection(connection_id)
+        return await self._retry_db(
+            "reloading business connection",
+            lambda: self.db.get_connection(connection_id),
+        )
 
     async def _notify_owner(
         self, pending: dict[str, Any], *, force: bool = False
@@ -337,6 +380,9 @@ class Assistant:
             require_trusted=self.settings.escalate_unknown_contacts,
         )
         if not state_is_current:
+            was_already_reserved = await self.db.is_reply_reserved(
+                connection_id, chat_id, incoming_message_id
+            )
             await self._escalate(
                 connection_id=connection_id,
                 chat_id=chat_id,
@@ -344,10 +390,14 @@ class Assistant:
                 contact=incoming,
                 incoming_text=incoming_text,
                 reason=(
-                    "состояние чата изменилось во время подготовки ответа "
-                    "(пауза, блокировка, ручной ответ, редактирование или удаление)"
+                    "предыдущая отправка могла состояться; проверьте чат "
+                    "перед ручным ответом"
+                    if was_already_reserved
+                    else "состояние чата изменилось во время подготовки ответа "
+                    "(пауза, блокировка, новое сообщение, ручной ответ, "
+                    "редактирование или удаление)"
                 ),
-                draft=decision.reply,
+                draft=None if was_already_reserved else decision.reply,
             )
             await self.db.mark_message_processed(
                 connection_id, chat_id, incoming_message_id
@@ -444,32 +494,43 @@ class Assistant:
                 )
                 if not connection:
                     return
-                await self.db.insert_message(
-                    connection_id=message.business_connection_id,
-                    chat_id=message.chat.id,
-                    telegram_message_id=message.message_id,
-                    role="owner",
-                    content=text,
+                await self._retry_db(
+                    "saving outgoing business message",
+                    lambda: self.db.insert_message(
+                        connection_id=message.business_connection_id,
+                        chat_id=message.chat.id,
+                        telegram_message_id=message.message_id,
+                        role="owner",
+                        content=text,
+                    ),
                 )
                 return
             connection = await self._ensure_connection(message.business_connection_id)
             if not connection or connection["owner_user_id"] != self.settings.owner_id:
                 return
             incoming_text, is_text = message_text(message)
-            await self.db.upsert_contact(
-                connection_id=message.business_connection_id,
-                chat_id=message.chat.id,
-                telegram_user_id=message.from_user.id if message.from_user else None,
-                username=message.chat.username,
-                first_name=message.chat.first_name,
-                last_name=message.chat.last_name,
+            await self._retry_db(
+                "saving incoming business contact",
+                lambda: self.db.upsert_contact(
+                    connection_id=message.business_connection_id,
+                    chat_id=message.chat.id,
+                    telegram_user_id=(
+                        message.from_user.id if message.from_user else None
+                    ),
+                    username=message.chat.username,
+                    first_name=message.chat.first_name,
+                    last_name=message.chat.last_name,
+                ),
             )
-            needs_processing = await self.db.begin_incoming_message(
-                connection_id=message.business_connection_id,
-                chat_id=message.chat.id,
-                telegram_message_id=message.message_id,
-                content=incoming_text,
-                is_text=is_text,
+            needs_processing = await self._retry_db(
+                "saving incoming business message",
+                lambda: self.db.begin_incoming_message(
+                    connection_id=message.business_connection_id,
+                    chat_id=message.chat.id,
+                    telegram_message_id=message.message_id,
+                    content=incoming_text,
+                    is_text=is_text,
+                ),
             )
             if needs_processing:
                 self._inbox_wakeup.set()
@@ -487,34 +548,48 @@ class Assistant:
                 or (message.from_user and self._is_owner(message.from_user.id))
             )
             if is_outgoing:
-                await self.db.insert_message(
-                    connection_id=message.business_connection_id,
-                    chat_id=message.chat.id,
-                    telegram_message_id=message.message_id,
-                    role="owner",
-                    content=text,
+                await self._retry_db(
+                    "saving edited outgoing message",
+                    lambda: self.db.insert_message(
+                        connection_id=message.business_connection_id,
+                        chat_id=message.chat.id,
+                        telegram_message_id=message.message_id,
+                        role="owner",
+                        content=text,
+                    ),
                 )
             else:
-                await self.db.upsert_contact(
-                    connection_id=message.business_connection_id,
-                    chat_id=message.chat.id,
-                    telegram_user_id=message.from_user.id if message.from_user else None,
-                    username=message.chat.username,
-                    first_name=message.chat.first_name,
-                    last_name=message.chat.last_name,
+                await self._retry_db(
+                    "saving edited message contact",
+                    lambda: self.db.upsert_contact(
+                        connection_id=message.business_connection_id,
+                        chat_id=message.chat.id,
+                        telegram_user_id=(
+                            message.from_user.id if message.from_user else None
+                        ),
+                        username=message.chat.username,
+                        first_name=message.chat.first_name,
+                        last_name=message.chat.last_name,
+                    ),
                 )
-                await self.db.begin_incoming_message(
-                    connection_id=message.business_connection_id,
-                    chat_id=message.chat.id,
-                    telegram_message_id=message.message_id,
-                    content=text,
-                    is_text=is_text,
+                await self._retry_db(
+                    "saving edited incoming message",
+                    lambda: self.db.begin_incoming_message(
+                        connection_id=message.business_connection_id,
+                        chat_id=message.chat.id,
+                        telegram_message_id=message.message_id,
+                        content=text,
+                        is_text=is_text,
+                    ),
                 )
-            await self.db.edit_message(
-                message.business_connection_id,
-                message.chat.id,
-                message.message_id,
-                text,
+            await self._retry_db(
+                "applying business message edit",
+                lambda: self.db.edit_message(
+                    message.business_connection_id,
+                    message.chat.id,
+                    message.message_id,
+                    text,
+                ),
             )
             self._inbox_wakeup.set()
 
@@ -523,10 +598,13 @@ class Assistant:
             connection = await self._ensure_connection(event.business_connection_id)
             if not connection or connection["owner_user_id"] != self.settings.owner_id:
                 return
-            await self.db.mark_messages_deleted(
-                event.business_connection_id,
-                event.chat.id,
-                event.message_ids,
+            await self._retry_db(
+                "saving deleted business messages",
+                lambda: self.db.mark_messages_deleted(
+                    event.business_connection_id,
+                    event.chat.id,
+                    event.message_ids,
+                ),
             )
 
         @router.message(CommandStart())
@@ -704,6 +782,14 @@ class Assistant:
     async def _retry_notifications(self) -> None:
         while not self._stopping.is_set():
             try:
+                recovered = await self.db.recover_stale_pending(
+                    self.settings.owner_id
+                )
+                if recovered:
+                    logger.error(
+                        "Marked %s stale sends as unknown; owner must inspect chats",
+                        recovered,
+                    )
                 items = await self.db.list_pending(
                     self.settings.owner_id,
                     limit=20,
@@ -760,19 +846,43 @@ class Assistant:
                 logger.exception("Inbox worker failed")
                 await asyncio.sleep(5)
 
+    async def _monitor_instance_lock(self, dispatcher: Dispatcher) -> None:
+        while not self._stopping.is_set():
+            try:
+                await asyncio.wait_for(self._stopping.wait(), timeout=5)
+                continue
+            except TimeoutError:
+                pass
+            if await self.db.instance_lock_healthy():
+                continue
+            logger.critical(
+                "PostgreSQL instance lock was lost; stopping to prevent duplicate replies"
+            )
+            self._stopping.set()
+            self._inbox_wakeup.set()
+            with suppress(RuntimeError):
+                await dispatcher.stop_polling()
+            return
+
     async def run(self) -> None:
         web_runner = None
         notification_task: asyncio.Task[None] | None = None
         inbox_task: asyncio.Task[None] | None = None
+        lock_monitor_task: asyncio.Task[None] | None = None
         try:
             await self.db.connect(
                 owner_id=self.settings.owner_id,
                 initially_paused=not self.settings.auto_reply_enabled,
             )
-            recovered = await self.db.recover_stale_pending(self.settings.owner_id)
+            recovered = await self.db.recover_all_processing(self.settings.owner_id)
             if recovered:
-                logger.warning("Recovered %s stale pending reviews", recovered)
-            web_runner = await start_webserver(self.settings.port, self.db.ping)
+                logger.error(
+                    "Marked %s interrupted sends as unknown; inspect their chats",
+                    recovered,
+                )
+            web_runner = await start_webserver(self.settings.port, self.db.healthy)
+            dispatcher = Dispatcher()
+            dispatcher.include_router(self.router)
             notification_task = asyncio.create_task(
                 self._retry_notifications(),
                 name="pending-notification-retry",
@@ -781,8 +891,10 @@ class Assistant:
                 self._process_inbox(),
                 name="durable-inbox-worker",
             )
-            dispatcher = Dispatcher()
-            dispatcher.include_router(self.router)
+            lock_monitor_task = asyncio.create_task(
+                self._monitor_instance_lock(dispatcher),
+                name="instance-lock-monitor",
+            )
             await self.bot.delete_webhook(drop_pending_updates=False)
             logger.info("Telegram Business assistant started")
             await dispatcher.start_polling(
@@ -795,7 +907,9 @@ class Assistant:
             self._stopping.set()
             self._inbox_wakeup.set()
             workers = [
-                task for task in (inbox_task, notification_task) if task is not None
+                task
+                for task in (inbox_task, notification_task, lock_monitor_task)
+                if task is not None
             ]
             if workers:
                 done, pending = await asyncio.wait(workers, timeout=40)
