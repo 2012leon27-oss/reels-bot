@@ -1,0 +1,22 @@
+[Unit]
+Description=SyntX Playwright bridge for Telegram Business neuroagent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tgbot
+Group=tgbot
+WorkingDirectory=/opt/telegram-business-bot
+EnvironmentFile=/opt/telegram-business-bot/.env
+ExecStart=/opt/telegram-business-bot/venv/bin/python -m integrations.syntx.bridge
+Restart=always
+RestartSec=5
+StandardOutput=append:/opt/telegram-business-bot/logs/syntx-bridge.log
+StandardError=append:/opt/telegram-business-bot/logs/syntx-bridge.log
+
+# Playwright needs a writable profile under the app tree
+ReadWritePaths=/opt/telegram-business-bot
+
+[Install]
+WantedBy=multi-user.target

@@ -1,26 +1,30 @@
-"""Small health server used by hosting platforms such as Render."""
+"""Small health server used by hosting platforms and local checks."""
 
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from aiohttp import web
 
-HealthCheck = Callable[[], Awaitable[bool]]
+HealthCheck = Callable[[], Awaitable[bool | dict[str, Any]]]
 
 
 async def start_webserver(port: int, health_check: HealthCheck) -> web.AppRunner:
     async def root(_: web.Request) -> web.Response:
         return web.json_response(
-            {"service": "telegram-business-assistant", "status": "running"}
+            {"service": "telegram-business-neuroagent", "status": "running"}
         )
 
     async def health(_: web.Request) -> web.Response:
-        healthy = await health_check()
-        return web.json_response(
-            {"status": "ok" if healthy else "unhealthy"},
-            status=200 if healthy else 503,
-        )
+        result = await health_check()
+        if isinstance(result, dict):
+            ok = bool(result.get("ok", True))
+            payload = result
+        else:
+            ok = bool(result)
+            payload = {"ok": ok, "status": "ok" if ok else "unhealthy"}
+        return web.json_response(payload, status=200 if ok else 503)
 
     app = web.Application()
     app.router.add_get("/", root)

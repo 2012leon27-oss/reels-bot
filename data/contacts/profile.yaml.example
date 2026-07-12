@@ -1,0 +1,25 @@
+# Пример необязательного YAML-профиля контакта.
+# Скопируйте в data/contacts/<telegram_user_id>/profile.yaml
+
+display_name: "Пример контакта"
+owner_alias: "Коллега"
+
+importance: normal          # low | normal | important | critical
+relationship: "работа"      # свободный текст
+ai_mode: assisted           # off | urgent_only | assisted | full_auto
+
+communication:
+  preferred_tone: "деловой, дружелюбный"
+  rules: |
+    - отвечать кратко
+    - не обещать сроки без согласования с владельцем
+  sensitive_topics: |
+    - зарплата
+    - личные отношения
+
+known_facts: |
+  - работает в смежном отделе
+  - предпочитает переписку в рабочее время
+
+notes: |
+  Дополнительный контекст, не дублирующий manual_owner_notes в БД.

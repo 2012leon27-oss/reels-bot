@@ -8,10 +8,17 @@ import random
 import unittest
 from uuid import uuid4
 
-from database import Database
+# Skip collection noise when asyncpg/legacy Database are unavailable.
+try:
+    from database import Database
+except ImportError:  # pragma: no cover
+    Database = None  # type: ignore[misc, assignment]
 
 
-@unittest.skipUnless(os.getenv("TEST_DATABASE_URL"), "TEST_DATABASE_URL is not set")
+@unittest.skipUnless(
+    os.getenv("TEST_DATABASE_URL") and Database is not None,
+    "TEST_DATABASE_URL is not set or asyncpg/database unavailable",
+)
 class DatabaseIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.owner_id = random.randint(10_000_000, 2_000_000_000)

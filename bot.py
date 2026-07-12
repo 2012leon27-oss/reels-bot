@@ -1,16 +1,15 @@
-"""Telegram Business assistant entrypoint and update handlers."""
+"""Telegram Business neuroagent — entrypoint and update handlers."""
 
 from __future__ import annotations
 
 import asyncio
-import html
 import logging
+import time
 from contextlib import suppress
-from pathlib import Path
 from typing import Any, Awaitable, Callable, TypeVar
 
-import asyncpg
 from aiogram import Bot, Dispatcher, Router
+from aiogram.enums import ChatAction
 from aiogram.exceptions import (
     TelegramBadRequest,
     TelegramForbiddenError,
@@ -22,18 +21,39 @@ from aiogram.types import (
     BusinessConnection,
     BusinessMessagesDeleted,
     CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
     Message,
+    Update,
 )
 
+from agent.andrey_policy import evaluate_andrey_policy, is_andrey_contact
+from agent.decision_v2 import AgentDecision, InvalidAgentDecision
+from agent.prompt_builder import build_claude_prompt, format_dialogue_line, load_knowledge
+from agent.queue import DialogueQueue, with_retries
+from alerts import CriticalAlertManager, send_owner_alert, try_send_sms_alert
+from author import classify_message_author
 from config import ConfigurationError, Settings
-from context_loader import ContextLoader
-from database import Database
-from decision import ReplyDecision
+from integrations.syntx import ModelMismatchError, SyntXBridgeError, SyntXClient
 from keep_alive import start_webserver
-from llm_client import LLMClient, LLMServiceError
+from memory import (
+    MEMORY_RETENTION_DAYS,
+    RECENT_MESSAGE_LIMIT,
+    maybe_close_session_and_summarize,
+    should_rotate_syntx_chat,
+    style_summary_from_owner_messages,
+)
 from policy import escalation_reason
+from profiles import (
+    apply_andrey_usenko_defaults,
+    get_contact_communication_rules,
+    get_contact_profile,
+    get_memory_summaries,
+    get_recent_dialogue,
+    load_style_summary,
+    normalize_person_name,
+    save_style_summary,
+    seed_pending_andrey_usenko_profile,
+)
+from store import Store
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,6 +61,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
+
+SAFE_HANDOFF_ACK = (
+    "Вижу, вопрос важный. Сейчас внимательно посмотрю и вернусь с ответом."
+)
 
 
 def message_text(message: Message) -> tuple[str, bool]:
@@ -51,197 +75,263 @@ def message_text(message: Message) -> tuple[str, bool]:
     return f"[{message.content_type}]", False
 
 
-def stored_contact_name(contact: dict[str, Any]) -> str:
+def contact_display_name(contact: dict[str, Any]) -> str:
+    alias = (contact.get("owner_alias") or "").strip()
+    if alias:
+        return alias
     first = contact.get("first_name") or ""
     last = contact.get("last_name") or ""
     name = " ".join(part for part in (first, last) if part).strip()
-    return name or contact.get("username") or str(contact["chat_id"])
-
-
-def review_keyboard(pending_id: int, has_draft: bool) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    if has_draft:
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text="✅ Отправить черновик",
-                    callback_data=f"send:{pending_id}",
-                )
-            ]
-        )
-    rows.append(
-        [
-            InlineKeyboardButton(
-                text="👤 Отвечу сам", callback_data=f"mine:{pending_id}"
-            ),
-            InlineKeyboardButton(
-                text="🚫 Не отвечать", callback_data=f"ignore:{pending_id}"
-            ),
-        ]
-    )
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    return name or contact.get("username") or str(contact.get("telegram_user_id") or "")
 
 
 class Assistant:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.bot = Bot(settings.bot_token)
-        self.db = Database(settings.database_url)
-        self.llm = LLMClient(settings)
-        self.contexts = ContextLoader(Path(__file__).resolve().parent / "contexts")
-        self.router = Router(name="business_assistant")
-        self._inbox_wakeup = asyncio.Event()
-        self._notification_lock = asyncio.Lock()
+        self.store = Store(settings.database_url)
+        self.syntx = SyntXClient(
+            base_url=settings.syntx_bridge_url.rsplit("/", 1)[0],
+            timeout=settings.syntx_timeout_seconds,
+        )
+        self.router = Router(name="business_neuroagent")
+        self.queue = DialogueQueue()
+        self.alert_manager = CriticalAlertManager()
+        self._bot_id: int | None = None
+        self._knowledge = load_knowledge()
         self._stopping = asyncio.Event()
+        self._inbox_wakeup = asyncio.Event()
         self._register_handlers()
 
     def _is_owner(self, user_id: int | None) -> bool:
         return user_id == self.settings.owner_id
 
-    async def _retry_db(
-        self, label: str, operation: Callable[[], Awaitable[T]]
-    ) -> T:
-        delay = 1
+    async def _bot_user_id(self) -> int:
+        if self._bot_id is None:
+            me = await self.bot.get_me()
+            self._bot_id = int(me.id)
+        return self._bot_id
+
+    async def _health(self) -> dict[str, Any]:
+        store_ok = await self.store.ping()
+        try:
+            bridge = await self.syntx.health()
+        except Exception as exc:
+            bridge = {
+                "ok": False,
+                "session_ok": False,
+                "model_available": False,
+                "queue_depth": self.queue.queue_depth,
+                "pages_count": 0,
+                "last_error": type(exc).__name__,
+            }
+        return {
+            "ok": store_ok,
+            "session_ok": bool(bridge.get("session_ok")),
+            "model_available": bool(bridge.get("model_available")),
+            "queue_depth": int(bridge.get("queue_depth") or self.queue.queue_depth),
+            "pages_count": int(bridge.get("pages_count") or 0),
+            "last_error": bridge.get("last_error"),
+            "store_ok": store_ok,
+        }
+
+    async def _typing_loop(self, chat_id: int, connection_id: str) -> None:
         while True:
             try:
-                return await operation()
-            except asyncio.CancelledError:
-                raise
-            except (
-                asyncpg.PostgresError,
-                asyncpg.InterfaceError,
-                ConnectionError,
-                OSError,
-                TimeoutError,
-            ):
-                logger.exception("%s failed; retrying durable persistence", label)
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, 30)
+                await self.bot.send_chat_action(
+                    chat_id=chat_id,
+                    action=ChatAction.TYPING,
+                    business_connection_id=connection_id,
+                )
+            except Exception:
+                return
+            await asyncio.sleep(4)
 
     async def _save_connection(self, connection: BusinessConnection) -> bool:
         if connection.user.id != self.settings.owner_id:
             logger.warning(
-                "Rejected business connection %s from unexpected owner %s",
-                connection.id,
+                "Rejected business connection from unexpected owner %s",
                 connection.user.id,
             )
             return False
         rights = connection.rights
-        await self._retry_db(
-            "saving business connection",
-            lambda: self.db.upsert_connection(
-                connection_id=connection.id,
-                owner_user_id=connection.user.id,
-                owner_chat_id=connection.user_chat_id,
-                is_enabled=connection.is_enabled,
-                can_reply=bool(rights and rights.can_reply),
-                can_read_messages=bool(rights and rights.can_read_messages),
-            ),
+        rights_json = "{}"
+        if rights is not None:
+            try:
+                rights_json = rights.model_dump_json()
+            except Exception:
+                rights_json = str(
+                    {
+                        "can_reply": bool(getattr(rights, "can_reply", False)),
+                        "can_read_messages": bool(
+                            getattr(rights, "can_read_messages", False)
+                        ),
+                    }
+                )
+        await self.store.upsert_business_connection(
+            business_connection_id=connection.id,
+            owner_telegram_id=connection.user.id,
+            enabled=bool(connection.is_enabled),
+            rights_json=rights_json,
         )
         return True
 
-    async def _ensure_connection(self, connection_id: str) -> dict[str, Any] | None:
-        stored = await self._retry_db(
-            "loading business connection",
-            lambda: self.db.get_connection(connection_id),
-        )
-        if stored:
-            return stored
-        delay = 1
-        while True:
-            try:
-                remote = await self.bot.get_business_connection(
-                    business_connection_id=connection_id
-                )
-                break
-            except (TelegramBadRequest, TelegramForbiddenError, TelegramNotFound):
-                logger.exception("Business connection %s is invalid", connection_id)
-                return None
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception(
-                    "Could not fetch business connection %s; retrying",
-                    connection_id,
-                )
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, 30)
-        if not await self._save_connection(remote):
-            return None
-        return await self._retry_db(
-            "reloading business connection",
-            lambda: self.db.get_connection(connection_id),
-        )
+    def _can_reply(self, connection: dict[str, Any]) -> bool:
+        if not connection.get("enabled"):
+            return False
+        raw = connection.get("rights_json") or "{}"
+        try:
+            import json
 
-    async def _notify_owner(
-        self, pending: dict[str, Any], *, force: bool = False
-    ) -> None:
-        async with self._notification_lock:
-            current = await self.db.get_pending(
-                int(pending["id"]), self.settings.owner_id
-            )
-            if not current or current["status"] != "pending":
-                return
-            if current.get("notification_message_id") and not force:
-                return
-            pending = current
-            incoming = html.escape(str(pending["incoming_text"])[:1700])
-            draft = pending.get("suggested_reply")
-            draft_block = (
-                f"\n\n<b>Черновик:</b>\n{html.escape(str(draft)[:1100])}"
-                if draft
-                else ""
-            )
-            text = (
-                "🔔 <b>Нужно ваше решение</b>\n\n"
-                f"<b>Собеседник:</b> {html.escape(str(pending['contact_name'])[:200])}\n"
-                f"<b>chat_id:</b> <code>{pending['chat_id']}</code>\n"
-                f"<b>Причина:</b> {html.escape(str(pending['reason'])[:500])}\n\n"
-                f"<b>Сообщение:</b>\n{incoming}"
-                f"{draft_block}\n\n"
-                "Можно нажать кнопку или ответить текстом прямо на это уведомление."
-            )
-            notification = await self.bot.send_message(
-                self.settings.owner_id,
-                text,
-                parse_mode="HTML",
-                reply_markup=review_keyboard(int(pending["id"]), bool(draft)),
-            )
-            await self.db.set_pending_notification(
-                int(pending["id"]), notification.message_id
-            )
+            data = json.loads(raw) if isinstance(raw, str) else raw
+            return bool(data.get("can_reply"))
+        except Exception:
+            return False
 
-    async def _escalate(
+    async def _ensure_contact_and_conversation(
         self,
         *,
         connection_id: str,
         chat_id: int,
-        incoming_message_id: int,
-        contact: dict[str, Any],
-        incoming_text: str,
-        reason: str,
-        draft: str | None,
-    ) -> None:
-        result = await self.db.create_pending(
-            connection_id=connection_id,
-            chat_id=chat_id,
-            incoming_message_id=incoming_message_id,
-            contact_name=stored_contact_name(contact),
-            incoming_text=incoming_text,
-            suggested_reply=draft,
-            reason=reason,
+        telegram_user_id: int | None,
+        username: str | None,
+        first_name: str | None,
+        last_name: str | None,
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        if telegram_user_id is None:
+            return None
+        contact = await self.store.get_or_create_contact(
+            business_connection_id=connection_id,
+            telegram_user_id=telegram_user_id,
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
         )
-        if result is None:
-            logger.info(
-                "Skipped stale escalation for %s/%s",
-                chat_id,
-                incoming_message_id,
+        await self._maybe_match_pending_name(contact)
+        conversation = await self.store.get_or_create_conversation(
+            business_connection_id=connection_id,
+            telegram_chat_id=chat_id,
+            contact_id=int(contact["id"]),
+        )
+        return contact, conversation
+
+    async def _maybe_match_pending_name(self, contact: dict[str, Any]) -> None:
+        full_name = normalize_person_name(
+            f"{contact.get('first_name') or ''} {contact.get('last_name') or ''}"
+        )
+        if not full_name:
+            return
+        bindings = await self.store.get_pending_bindings_by_name(full_name)
+        pending = [b for b in bindings if b.get("status") == "pending"]
+        if not pending:
+            return
+        # Multiple people with same name → never auto-bind.
+        if len(pending) > 1:
+            return
+        binding = pending[0]
+        if binding.get("candidate_telegram_user_id") and int(
+            binding["candidate_telegram_user_id"]
+        ) != int(contact["telegram_user_id"]):
+            # Second distinct candidate — require owner decision, do not overwrite.
+            await self.bot.send_message(
+                self.settings.owner_id,
+                (
+                    f"Найден ещё один кандидат на имя «{full_name}»: "
+                    f"id={contact['telegram_user_id']}. Автопривязка отменена. "
+                    f"Используйте /contact_bind {contact['telegram_user_id']} {full_name}"
+                ),
             )
             return
-        pending, _created = result
-        if pending.get("notification_message_id"):
-            return
-        await self._notify_owner(pending)
+        if not binding.get("candidate_telegram_user_id"):
+            await self.store.create_pending_name_binding(
+                normalized_name=full_name,
+                candidate_telegram_user_id=int(contact["telegram_user_id"]),
+            )
+            # Re-fetch / update candidate on existing row if API upserts.
+            with suppress(Exception):
+                await self.store.set_pending_binding_status(
+                    int(binding["id"]), "pending"
+                )
+            await self.bot.send_message(
+                self.settings.owner_id,
+                (
+                    f"Кандидат на профиль «{full_name}»: "
+                    f"telegram_user_id={contact['telegram_user_id']}. "
+                    f"Подтвердите: /contact_bind {contact['telegram_user_id']} {full_name}"
+                ),
+            )
+            with suppress(Exception):
+                await self.store.mark_pending_binding_notified(int(binding["id"]))
+
+    async def _perform_handoff(
+        self,
+        *,
+        conversation: dict[str, Any],
+        contact: dict[str, Any],
+        reason: str,
+        urgency: str,
+        safe_reply: str = "",
+        connection_id: str | None = None,
+        chat_id: int | None = None,
+    ) -> None:
+        await self.store.set_conversation_mode(
+            int(conversation["id"]), "human", handoff_reason=reason
+        )
+        alert = await self.store.create_alert(
+            conversation_id=int(conversation["id"]),
+            level=urgency if urgency in {"normal", "urgent", "critical"} else "urgent",
+            reason=reason,
+        )
+        recent = await self.store.get_recent_messages(
+            int(conversation["id"]), limit=8
+        )
+        recent_lines = [
+            format_dialogue_line(m, contact_label=contact_display_name(contact))
+            for m in recent
+        ]
+        await send_owner_alert(
+            self.bot,
+            self.settings.owner_id,
+            contact,
+            reason,
+            urgency if urgency in {"normal", "urgent", "critical"} else "urgent",  # type: ignore[arg-type]
+            recent_lines,
+            str(conversation["id"]),
+            str(alert["id"]),
+        )
+        if urgency == "critical":
+            try_send_sms_alert(
+                reason=reason,
+                urgency=urgency,  # type: ignore[arg-type]
+                provider=self.settings.sms_provider,
+                api_key=self.settings.sms_api_key,
+                sms_from=self.settings.sms_from,
+                owner_phone=self.settings.owner_phone,
+            )
+            self.alert_manager.schedule(
+                bot=self.bot,
+                owner_id=self.settings.owner_id,
+                contact=contact,
+                reason=reason,
+                recent_lines=recent_lines,
+                conversation_id=str(conversation["id"]),
+                alert_id=str(alert["id"]),
+                on_repeat=lambda: self.store.increment_alert_repeat(int(alert["id"])),
+            )
+        if safe_reply and connection_id and chat_id is not None:
+            with suppress(Exception):
+                await self._send_business_reply(
+                    connection_id=connection_id,
+                    chat_id=chat_id,
+                    text=safe_reply,
+                    conversation_id=int(conversation["id"]),
+                    author_type="ai_assistant",
+                )
+
+    async def _alert_acked(self, alert_id: int) -> bool:
+        # list_unacked_critical excludes acked; check via acknowledge no-op read
+        rows = await self.store.list_unacked_critical()
+        return all(int(r["id"]) != alert_id for r in rows)
 
     async def _send_business_reply(
         self,
@@ -249,219 +339,362 @@ class Assistant:
         connection_id: str,
         chat_id: int,
         text: str,
-        prevalidated: bool = False,
+        conversation_id: int,
+        author_type: str = "ai_assistant",
     ) -> Message:
-        if not prevalidated:
-            connection = await self._ensure_connection(connection_id)
-            if not connection or not connection["is_enabled"]:
-                raise RuntimeError("Business connection is unavailable")
-            if connection["owner_user_id"] != self.settings.owner_id:
-                raise RuntimeError("Business connection belongs to a different owner")
-            if not connection["can_reply"]:
-                raise RuntimeError("Bot has no right to reply through this connection")
-
         sent = await self.bot.send_message(
             chat_id=chat_id,
             text=text,
             business_connection_id=connection_id,
             parse_mode=None,
         )
-        try:
-            await self.db.insert_message(
-                connection_id=connection_id,
-                chat_id=chat_id,
-                telegram_message_id=sent.message_id,
-                role="owner",
-                content=text,
-            )
-        except Exception:
-            # Telegram already accepted the message. Never retry delivery merely
-            # because local bookkeeping failed; the outgoing update can reconcile it.
-            logger.exception("Reply sent, but outgoing history could not be saved")
+        await self.store.save_message(
+            conversation_id=conversation_id,
+            telegram_message_id=sent.message_id,
+            author_type=author_type,
+            text=text,
+        )
+        await self.store.increment_syntx_message_count(conversation_id)
         return sent
 
-    async def _process_incoming(self, incoming: dict[str, Any]) -> None:
-        connection_id = str(incoming["connection_id"])
-        chat_id = int(incoming["chat_id"])
-        incoming_message_id = int(incoming["telegram_message_id"])
-        connection = await self._ensure_connection(connection_id)
-        if not connection or connection["owner_user_id"] != self.settings.owner_id:
-            return
+    async def _ask_syntx(
+        self, *, prompt: str, conversation: dict[str, Any]
+    ) -> AgentDecision:
+        chat_url = conversation.get("syntx_chat_url")
+        rotate = should_rotate_syntx_chat(conversation) or not chat_url
 
-        incoming_text = str(incoming["content"])
-        is_text = bool(incoming["is_text"])
-        context = self.contexts.load(chat_id)
-        paused = await self.db.is_paused(self.settings.owner_id)
-        policy_reason = escalation_reason(
-            text=incoming_text if is_text else None,
-            is_text_message=is_text,
-            runtime_paused=paused,
-            auto_reply_enabled=self.settings.auto_reply_enabled,
-            context_configured=context.is_configured,
-            contact_trusted=bool(incoming["trusted_for_auto_reply"]),
-            escalate_unknown_contacts=self.settings.escalate_unknown_contacts,
-        )
-
-        decision: ReplyDecision | None = None
-        can_ask_llm = (
-            is_text
-            and context.is_configured
-            and self.settings.auto_reply_enabled
-            and not paused
-        )
-        if can_ask_llm:
-            history = await self.db.get_history(
-                connection_id=connection_id,
-                chat_id=chat_id,
-                limit=self.settings.history_limit,
-                exclude_message_id=incoming_message_id,
-            )
-            try:
-                decision = await self.llm.decide(
-                    incoming_text=incoming_text,
-                    contact_name=stored_contact_name(incoming),
-                    contact_notes=str(incoming["notes"]),
-                    context=context,
-                    history=history,
+        async def _call() -> dict[str, Any]:
+            if rotate or not chat_url:
+                return await self.syntx.create_chat(
+                    prompt,
+                    model="Claude 4.8 Opus",
+                    strict_model=True,
                 )
-            except LLMServiceError:
-                logger.exception("LLM failed for chat %s", chat_id)
-                policy_reason = policy_reason or "ошибка языковой модели"
-
-        should_escalate = (
-            decision is None
-            or decision.must_escalate(
-                self.settings.confidence_threshold, policy_reason
+            return await self.syntx.chat(
+                prompt,
+                chat_url=str(chat_url),
+                model="Claude 4.8 Opus",
+                strict_model=True,
             )
-            or not connection["is_enabled"]
-            or not connection["can_reply"]
-        )
-        if should_escalate:
-            reasons = [
-                reason
-                for reason in (
-                    policy_reason,
-                    decision.reason if decision and decision.action == "escalate" else None,
-                    (
-                        f"низкая уверенность: {decision.confidence:.2f}"
-                        if decision
-                        and decision.confidence < self.settings.confidence_threshold
-                        else None
-                    ),
-                    "нет права Telegram на ответы"
-                    if not connection["can_reply"]
-                    else None,
-                    "Business-подключение отключено"
-                    if not connection["is_enabled"]
-                    else None,
-                )
-                if reason
-            ]
-            await self._escalate(
-                connection_id=connection_id,
-                chat_id=chat_id,
-                incoming_message_id=incoming_message_id,
-                contact=incoming,
-                incoming_text=incoming_text,
-                reason="; ".join(dict.fromkeys(reasons)) or "требуется решение владельца",
-                draft=decision.reply if decision else None,
-            )
-            await self.db.mark_message_processed(
-                connection_id, chat_id, incoming_message_id
-            )
-            return
-
-        assert decision is not None and decision.reply is not None
-        state_is_current = await self.db.reserve_auto_reply(
-            owner_id=self.settings.owner_id,
-            connection_id=connection_id,
-            chat_id=chat_id,
-            incoming_message_id=incoming_message_id,
-            require_trusted=self.settings.escalate_unknown_contacts,
-        )
-        if not state_is_current:
-            was_already_reserved = await self.db.is_reply_reserved(
-                connection_id, chat_id, incoming_message_id
-            )
-            await self._escalate(
-                connection_id=connection_id,
-                chat_id=chat_id,
-                incoming_message_id=incoming_message_id,
-                contact=incoming,
-                incoming_text=incoming_text,
-                reason=(
-                    "предыдущая отправка могла состояться; проверьте чат "
-                    "перед ручным ответом"
-                    if was_already_reserved
-                    else "состояние чата изменилось во время подготовки ответа "
-                    "(пауза, блокировка, новое сообщение, ручной ответ, "
-                    "редактирование или удаление)"
-                ),
-                draft=None if was_already_reserved else decision.reply,
-            )
-            await self.db.mark_message_processed(
-                connection_id, chat_id, incoming_message_id
-            )
-            return
 
         try:
+            result = await with_retries(
+                _call,
+                attempts=self.settings.syntx_max_retries,
+                label="syntx",
+            )
+        except ModelMismatchError as exc:
+            raise SyntXBridgeError(f"model mismatch: {exc}") from exc
+
+        resolved = result.get("resolved_chat_url") or chat_url
+        if resolved and (rotate or resolved != chat_url):
+            await self.store.set_syntx_chat_url(
+                int(conversation["id"]), str(resolved), reset_message_count=True
+            )
+        else:
+            await self.store.increment_syntx_message_count(int(conversation["id"]))
+
+        answer = str(result.get("answer") or "")
+        try:
+            return AgentDecision.from_json(answer)
+        except InvalidAgentDecision:
+            # Some bridges return prose+JSON; if unusable → handoff
+            return AgentDecision.handoff(
+                "неоднозначный или повреждённый ответ модели", urgency="urgent"
+            )
+
+    async def _process_contact_message(
+        self,
+        *,
+        connection: dict[str, Any],
+        contact: dict[str, Any],
+        conversation: dict[str, Any],
+        text: str,
+        is_text: bool,
+        telegram_message_id: int,
+    ) -> None:
+        connection_id = str(connection["business_connection_id"])
+        chat_id = int(conversation["telegram_chat_id"])
+        conversation_id = int(conversation["id"])
+
+        # Refresh conversation (mode may have changed)
+        conversation = await self.store.get_conversation_by_id(conversation_id) or conversation
+        if str(conversation.get("mode")) == "human":
+            logger.info("Conversation %s in human mode — AI silent", conversation_id)
+            return
+
+        profile = await get_contact_profile(
+            self.store,
+            int(contact["telegram_user_id"]),
+            business_connection_id=connection_id,
+        )
+        # Session inactivity → summarize before continuing
+        with suppress(Exception):
+            await maybe_close_session_and_summarize(self.store, conversation)
+
+        if is_andrey_contact(profile) or (
+            str(profile.get("ai_mode") or "") == "urgent_only"
+            and "андрей" in normalize_person_name(
+                f"{profile.get('owner_alias') or ''} "
+                f"{profile.get('first_name') or ''} {profile.get('last_name') or ''}"
+            )
+            and "усенко"
+            in normalize_person_name(
+                f"{profile.get('owner_alias') or ''} "
+                f"{profile.get('first_name') or ''} {profile.get('last_name') or ''}"
+            )
+        ):
+            policy = evaluate_andrey_policy(text)
+            if policy.kind == "silent":
+                return
+            await self._perform_handoff(
+                conversation=conversation,
+                contact=contact,
+                reason=policy.decision.handoff_reason,
+                urgency=policy.decision.urgency,
+                safe_reply=policy.decision.reply or SAFE_HANDOFF_ACK,
+                connection_id=connection_id,
+                chat_id=chat_id,
+            )
+            return
+
+        if str(profile.get("ai_mode") or "") == "human":
+            return
+        if str(profile.get("ai_mode") or "") == "restricted":
+            await self._perform_handoff(
+                conversation=conversation,
+                contact=contact,
+                reason="контакт в режиме restricted",
+                urgency="urgent",
+            )
+            return
+
+        policy_reason = escalation_reason(
+            text=text if is_text else None,
+            is_text_message=is_text,
+            runtime_paused=not self.settings.auto_reply_enabled,
+            auto_reply_enabled=self.settings.auto_reply_enabled,
+            context_configured=bool(
+                self._knowledge.get("identity.md")
+                and "[TODO:" not in (self._knowledge.get("identity.md") or "")
+            ),
+            contact_trusted=str(profile.get("ai_mode") or "normal")
+            not in {"human", "urgent_only"},
+            escalate_unknown_contacts=True,
+        )
+
+        if not is_text:
+            await self._perform_handoff(
+                conversation=conversation,
+                contact=contact,
+                reason=policy_reason or "нетекстовое сообщение",
+                urgency="normal",
+            )
+            return
+
+        if policy_reason and not self.settings.auto_reply_enabled:
+            await self._perform_handoff(
+                conversation=conversation,
+                contact=contact,
+                reason=policy_reason,
+                urgency="normal",
+            )
+            return
+
+        if not self._can_reply(connection):
+            await self._perform_handoff(
+                conversation=conversation,
+                contact=contact,
+                reason="нет права can_reply у Business-бота",
+                urgency="urgent",
+            )
+            return
+
+        typing_task = asyncio.create_task(
+            self._typing_loop(chat_id, connection_id), name=f"typing-{chat_id}"
+        )
+        enqueued_at = time.monotonic()
+        dialogue_key = f"{connection_id}:{chat_id}"
+
+        async def _stale_ok() -> bool:
+            current = await self.store.get_conversation_by_id(conversation_id)
+            return bool(current and current.get("mode") == "ai")
+
+        async def _job() -> None:
+            rules_payload = await get_contact_communication_rules(
+                self.store,
+                int(contact["telegram_user_id"]),
+                business_connection_id=connection_id,
+            )
+            rules = str(
+                rules_payload.get("communication_rules")
+                if isinstance(rules_payload, dict)
+                else rules_payload
+                or ""
+            )
+            memories = await get_memory_summaries(
+                self.store,
+                int(contact["telegram_user_id"]),
+                days=self.settings.memory_retention_days,
+                business_connection_id=connection_id,
+            )
+            recent = await self.store.get_recent_messages(
+                conversation_id, limit=self.settings.history_limit
+            )
+            # Exclude AI replies from style; build style from owner only.
+            owner_msgs = [m for m in recent if m.get("author_type") == "owner"]
+            style = load_style_summary(int(contact["telegram_user_id"])) or ""
+            auto_style = style_summary_from_owner_messages(owner_msgs)
+            if auto_style:
+                save_style_summary(int(contact["telegram_user_id"]), auto_style)
+                style = auto_style
+
+            prompt = build_claude_prompt(
+                profile=profile or {},
+                rules=rules,
+                memory_summaries=memories,
+                recent_messages=recent,
+                current_message=text,
+                knowledge=self._knowledge,
+                style_summary=style,
+                memory_days=self.settings.memory_retention_days,
+            )
+            try:
+                decision = await self._ask_syntx(
+                    prompt=prompt, conversation=conversation
+                )
+            except (SyntXBridgeError, ModelMismatchError, Exception) as exc:
+                logger.exception("SyntX unavailable for dialogue %s", dialogue_key)
+                await self._perform_handoff(
+                    conversation=conversation,
+                    contact=contact,
+                    reason=f"SyntX недоступен или модель не подтверждена: {type(exc).__name__}",
+                    urgency="critical",
+                    connection_id=connection_id,
+                    chat_id=chat_id,
+                )
+                return
+
+            if decision.action == "silent":
+                return
+
+            must = decision.must_handoff(
+                self.settings.confidence_threshold, policy_reason
+            )
+            if must or decision.action == "handoff":
+                await self._perform_handoff(
+                    conversation=conversation,
+                    contact=contact,
+                    reason=decision.handoff_reason or policy_reason or "handoff",
+                    urgency=decision.urgency,
+                    safe_reply=(
+                        decision.reply
+                        if decision.reply and decision.urgency in {"urgent", "critical"}
+                        else ""
+                    ),
+                    connection_id=connection_id,
+                    chat_id=chat_id,
+                )
+                return
+
+            # Re-check before send (owner may have spoken / handoff)
+            current = await self.store.get_conversation_by_id(conversation_id)
+            if not current or current.get("mode") != "ai":
+                return
             await self._send_business_reply(
                 connection_id=connection_id,
                 chat_id=chat_id,
                 text=decision.reply,
-                prevalidated=True,
+                conversation_id=conversation_id,
             )
-        except Exception:
-            logger.exception("Automatic business reply could not be delivered")
-            await self._escalate(
-                connection_id=connection_id,
-                chat_id=chat_id,
-                incoming_message_id=incoming_message_id,
-                contact=incoming,
-                incoming_text=incoming_text,
-                reason=(
-                    "статус доставки автоматического ответа неизвестен; "
-                    "проверьте чат перед ручным ответом"
-                ),
-                draft=None,
-            )
-        await self.db.mark_message_processed(
-            connection_id, chat_id, incoming_message_id
-        )
 
-    async def _send_pending_text(
-        self, pending_id: int, text: str
-    ) -> tuple[bool, str]:
-        pending = await self.db.claim_pending(pending_id, self.settings.owner_id)
-        if not pending:
-            return False, "Это обращение уже обработано."
         try:
-            await self._send_business_reply(
-                connection_id=str(pending["connection_id"]),
-                chat_id=int(pending["chat_id"]),
-                text=text,
-                prevalidated=True,
+            await self.queue.run_for_dialogue(
+                dialogue_key,
+                _job,
+                enqueued_at=enqueued_at,
+                max_age_seconds=180.0,
+                stale_check=_stale_ok,
             )
-        except (
-            TelegramBadRequest,
-            TelegramForbiddenError,
-            TelegramNotFound,
-            TelegramRetryAfter,
-        ) as exc:
-            await self.db.release_pending(pending_id)
-            logger.exception("Owner-approved reply failed")
-            return False, f"Не удалось отправить: {exc}"
-        except Exception:
-            logger.exception("Owner-approved reply has unknown delivery status")
-            await self.db.resolve_pending(
-                pending_id, "send_unknown", self.settings.owner_id
+        finally:
+            typing_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await typing_task
+
+    async def _handle_business_message(self, message: Message, update_id: int | None) -> None:
+        if not message.business_connection_id:
+            return
+        if update_id is not None and await self.store.is_update_processed(update_id):
+            return
+
+        connection = await self.store.get_business_connection(
+            message.business_connection_id
+        )
+        if not connection:
+            remote = await self.bot.get_business_connection(
+                business_connection_id=message.business_connection_id
             )
-            return (
-                False,
-                "Статус доставки неизвестен. Проверьте чат перед повторным ответом.",
+            if not await self._save_connection(remote):
+                return
+            connection = await self.store.get_business_connection(
+                message.business_connection_id
             )
-        await self.db.resolve_pending(pending_id, "sent", self.settings.owner_id)
-        return True, "Ответ отправлен."
+        if not connection or int(connection["owner_telegram_id"]) != self.settings.owner_id:
+            return
+
+        bot_id = await self._bot_user_id()
+        author = classify_message_author(
+            message, bot_id=bot_id, owner_telegram_id=self.settings.owner_id
+        )
+        text, is_text = message_text(message)
+
+        # Resolve peer user id for the chat
+        peer_id = message.chat.id
+        if author == "contact" and message.from_user:
+            peer_id = message.from_user.id
+
+        contact_pack = await self._ensure_contact_and_conversation(
+            connection_id=message.business_connection_id,
+            chat_id=message.chat.id,
+            telegram_user_id=peer_id if author == "contact" else (
+                message.chat.id  # personal chat id equals peer user id in private chats
+            ),
+            username=message.chat.username,
+            first_name=message.chat.first_name,
+            last_name=message.chat.last_name,
+        )
+        if not contact_pack:
+            return
+        contact, conversation = contact_pack
+
+        await self.store.save_message(
+            conversation_id=int(conversation["id"]),
+            telegram_message_id=message.message_id,
+            author_type=author,
+            text=text,
+        )
+        if update_id is not None:
+            await self.store.mark_update_processed(update_id)
+
+        if author in {"ai_assistant", "other_bot", "automatic"}:
+            return
+
+        if author == "owner":
+            # Owner spoke → force human mode so AI does not interrupt.
+            await self.store.set_conversation_mode(
+                int(conversation["id"]), "human", handoff_reason="владелец ответил сам"
+            )
+            return
+
+        # contact
+        await self._process_contact_message(
+            connection=connection,
+            contact=contact,
+            conversation=conversation,
+            text=text,
+            is_text=is_text,
+            telegram_message_id=message.message_id,
+        )
 
     def _register_handlers(self) -> None:
         router = self.router
@@ -471,247 +704,285 @@ class Assistant:
             accepted = await self._save_connection(connection)
             if not accepted:
                 return
-            state = "подключён" if connection.is_enabled else "отключён"
-            can_reply = bool(connection.rights and connection.rights.can_reply)
+            rights = connection.rights
+            can_reply = bool(rights and rights.can_reply)
             await self.bot.send_message(
                 self.settings.owner_id,
-                f"Business-бот {state}. Право отвечать: "
-                f"{'есть' if can_reply else 'нет'}.",
+                f"Business-бот {'подключён' if connection.is_enabled else 'отключён'}. "
+                f"Право отвечать: {'есть' if can_reply else 'нет'}.",
             )
 
         @router.business_message()
         async def on_business_message(message: Message) -> None:
-            if not message.business_connection_id:
-                return
-            is_outgoing = bool(
-                message.sender_business_bot
-                or (message.from_user and self._is_owner(message.from_user.id))
-            )
-            if is_outgoing:
-                text, _ = message_text(message)
-                connection = await self._ensure_connection(
-                    message.business_connection_id
-                )
-                if not connection:
-                    return
-                await self._retry_db(
-                    "saving outgoing business message",
-                    lambda: self.db.insert_message(
-                        connection_id=message.business_connection_id,
-                        chat_id=message.chat.id,
-                        telegram_message_id=message.message_id,
-                        role="owner",
-                        content=text,
-                    ),
-                )
-                return
-            connection = await self._ensure_connection(message.business_connection_id)
-            if not connection or connection["owner_user_id"] != self.settings.owner_id:
-                return
-            incoming_text, is_text = message_text(message)
-            await self._retry_db(
-                "saving incoming business contact",
-                lambda: self.db.upsert_contact(
-                    connection_id=message.business_connection_id,
-                    chat_id=message.chat.id,
-                    telegram_user_id=(
-                        message.from_user.id if message.from_user else None
-                    ),
-                    username=message.chat.username,
-                    first_name=message.chat.first_name,
-                    last_name=message.chat.last_name,
-                ),
-            )
-            needs_processing = await self._retry_db(
-                "saving incoming business message",
-                lambda: self.db.begin_incoming_message(
-                    connection_id=message.business_connection_id,
-                    chat_id=message.chat.id,
-                    telegram_message_id=message.message_id,
-                    content=incoming_text,
-                    is_text=is_text,
-                ),
-            )
-            if needs_processing:
-                self._inbox_wakeup.set()
+            await self._handle_business_message(message, None)
 
         @router.edited_business_message()
         async def on_edited_business_message(message: Message) -> None:
             if not message.business_connection_id:
                 return
-            connection = await self._ensure_connection(message.business_connection_id)
-            if not connection or connection["owner_user_id"] != self.settings.owner_id:
+            connection = await self.store.get_business_connection(
+                message.business_connection_id
+            )
+            if not connection:
                 return
-            text, is_text = message_text(message)
-            is_outgoing = bool(
-                message.sender_business_bot
-                or (message.from_user and self._is_owner(message.from_user.id))
+            pack = await self._ensure_contact_and_conversation(
+                connection_id=message.business_connection_id,
+                chat_id=message.chat.id,
+                telegram_user_id=message.chat.id,
+                username=message.chat.username,
+                first_name=message.chat.first_name,
+                last_name=message.chat.last_name,
             )
-            if is_outgoing:
-                await self._retry_db(
-                    "saving edited outgoing message",
-                    lambda: self.db.insert_message(
-                        connection_id=message.business_connection_id,
-                        chat_id=message.chat.id,
-                        telegram_message_id=message.message_id,
-                        role="owner",
-                        content=text,
-                    ),
-                )
-            else:
-                await self._retry_db(
-                    "saving edited message contact",
-                    lambda: self.db.upsert_contact(
-                        connection_id=message.business_connection_id,
-                        chat_id=message.chat.id,
-                        telegram_user_id=(
-                            message.from_user.id if message.from_user else None
-                        ),
-                        username=message.chat.username,
-                        first_name=message.chat.first_name,
-                        last_name=message.chat.last_name,
-                    ),
-                )
-                await self._retry_db(
-                    "saving edited incoming message",
-                    lambda: self.db.begin_incoming_message(
-                        connection_id=message.business_connection_id,
-                        chat_id=message.chat.id,
-                        telegram_message_id=message.message_id,
-                        content=text,
-                        is_text=is_text,
-                    ),
-                )
-            await self._retry_db(
-                "applying business message edit",
-                lambda: self.db.edit_message(
-                    message.business_connection_id,
-                    message.chat.id,
-                    message.message_id,
-                    text,
-                ),
+            if not pack:
+                return
+            _contact, conversation = pack
+            text, _ = message_text(message)
+            await self.store.mark_message_edited(
+                int(conversation["id"]), message.message_id, text=text
             )
-            self._inbox_wakeup.set()
 
         @router.deleted_business_messages()
         async def on_deleted_business_messages(event: BusinessMessagesDeleted) -> None:
-            connection = await self._ensure_connection(event.business_connection_id)
-            if not connection or connection["owner_user_id"] != self.settings.owner_id:
-                return
-            await self._retry_db(
-                "saving deleted business messages",
-                lambda: self.db.mark_messages_deleted(
-                    event.business_connection_id,
-                    event.chat.id,
-                    event.message_ids,
-                ),
+            connection = await self.store.get_business_connection(
+                event.business_connection_id
             )
+            if not connection:
+                return
+            conversation = await self.store.get_or_create_conversation(
+                business_connection_id=event.business_connection_id,
+                telegram_chat_id=event.chat.id,
+                contact_id=(
+                    await self.store.get_or_create_contact(
+                        business_connection_id=event.business_connection_id,
+                        telegram_user_id=event.chat.id,
+                        username=None,
+                        first_name=None,
+                        last_name=None,
+                    )
+                )["id"],
+            )
+            for mid in event.message_ids:
+                await self.store.mark_message_deleted(int(conversation["id"]), mid)
 
         @router.message(CommandStart())
         async def owner_start(message: Message) -> None:
             if not self._is_owner(message.from_user.id if message.from_user else None):
+                logger.warning("Non-owner /start from %s", message.from_user.id if message.from_user else None)
                 return
             await message.answer(
-                "Личный Business-ассистент запущен.\n\n"
-                "Сначала подключите этого бота в Telegram → Настройки → "
-                "Telegram Business → Чат-боты и дайте право отвечать.\n\n"
-                "Команды: /status, /pause, /resume, /pending, /allow, /block, /note"
+                "Business-нейроагент готов.\n"
+                "Подключите бота в Telegram Business и дайте can_reply.\n"
+                "Команды: /status /contact_show /contact_set_mode /contact_pause_ai "
+                "/contact_resume_ai /contact_bind /alert_ack"
             )
 
         @router.message(Command("status"))
         async def owner_status(message: Message) -> None:
             if not self._is_owner(message.from_user.id if message.from_user else None):
-                return
-            paused = await self.db.is_paused(self.settings.owner_id)
-            context_ready = self.contexts.load(0).is_configured
-            stats = await self.db.stats(self.settings.owner_id)
-            await message.answer(
-                "Статус ассистента:\n"
-                f"• системный автоответ: {'включён' if self.settings.auto_reply_enabled else 'выключен'}\n"
-                f"• ручная пауза: {'да' if paused else 'нет'}\n"
-                f"• контекст заполнен: {'да' if context_ready else 'нет'}\n"
-                f"• контактов: {stats['contacts']}\n"
-                f"• сообщений в истории: {stats['messages']}\n"
-                f"• ждут решения: {stats['pending']}"
-            )
-
-        @router.message(Command("pause"))
-        async def owner_pause(message: Message) -> None:
-            if not self._is_owner(message.from_user.id if message.from_user else None):
-                return
-            await self.db.set_paused(self.settings.owner_id, True)
-            await message.answer("Автоответы приостановлены. Все новые сообщения идут вам.")
-
-        @router.message(Command("resume"))
-        async def owner_resume(message: Message) -> None:
-            if not self._is_owner(message.from_user.id if message.from_user else None):
-                return
-            if not self.settings.auto_reply_enabled:
-                await message.answer(
-                    "AUTO_REPLY_ENABLED=false. Сначала включите переменную окружения "
-                    "и перезапустите сервис."
-                )
-                return
-            if not self.contexts.load(0).is_configured:
-                await message.answer(
-                    "Контекст не заполнен. Заполните contexts/owner.md, style.md и rules.md."
-                )
-                return
-            await self.db.set_paused(self.settings.owner_id, False)
-            await message.answer("Автоответы включены для разрешённых контактов.")
-
-        @router.message(Command("pending"))
-        async def owner_pending(message: Message) -> None:
-            if not self._is_owner(message.from_user.id if message.from_user else None):
-                return
-            items = await self.db.list_pending(self.settings.owner_id)
-            if not items:
-                await message.answer("Необработанных сообщений нет.")
-                return
-            for item in items:
-                try:
-                    await self._notify_owner(item, force=True)
-                except Exception:
-                    logger.exception("Could not resend pending review %s", item["id"])
-
-        @router.message(Command("allow", "block", "note"))
-        async def owner_contact_command(message: Message) -> None:
-            if not self._is_owner(message.from_user.id if message.from_user else None):
-                return
-            parts = (message.text or "").split(maxsplit=2)
-            command = parts[0].split("@", 1)[0].lstrip("/")
-            if len(parts) < 2:
-                await message.answer(f"Формат: /{command} <chat_id>" + (
-                    " <заметка>" if command == "note" else ""
-                ))
+                logger.warning("Rejected admin command from non-owner")
                 return
             try:
-                chat_id = int(parts[1])
+                health = await self.syntx.health()
+            except Exception as exc:
+                health = {"ok": False, "last_error": type(exc).__name__}
+            await message.answer(
+                "Статус:\n"
+                f"• auto_reply: {self.settings.auto_reply_enabled}\n"
+                f"• syntx ok: {health.get('ok')}\n"
+                f"• session_ok: {health.get('session_ok')}\n"
+                f"• model_available: {health.get('model_available')}\n"
+                f"• queue_depth: {self.queue.queue_depth}\n"
+                f"• pages_count: {health.get('pages_count')}\n"
+                f"• last_error: {health.get('last_error')}"
+            )
+
+        async def _require_owner(message: Message) -> bool:
+            if self._is_owner(message.from_user.id if message.from_user else None):
+                return True
+            logger.warning(
+                "Rejected admin command from user_id=%s",
+                message.from_user.id if message.from_user else None,
+            )
+            await message.answer("Недостаточно прав.")
+            return False
+
+        @router.message(Command("contact_show"))
+        async def contact_show(message: Message) -> None:
+            if not await _require_owner(message):
+                return
+            parts = (message.text or "").split()
+            if len(parts) < 2:
+                await message.answer("Формат: /contact_show <telegram_user_id>")
+                return
+            try:
+                uid = int(parts[1])
             except ValueError:
-                await message.answer("chat_id должен быть числом из уведомления.")
+                await message.answer("telegram_user_id должен быть числом")
                 return
-            contact = await self.db.find_contact(self.settings.owner_id, chat_id)
+            profile = await get_contact_profile(self.store, uid)
+            if not profile:
+                await message.answer("Контакт не найден.")
+                return
+            await message.answer(
+                "\n".join(
+                    f"{k}: {profile.get(k)}"
+                    for k in (
+                        "telegram_user_id",
+                        "owner_alias",
+                        "importance",
+                        "relationship",
+                        "ai_mode",
+                        "preferred_tone",
+                        "manual_owner_notes",
+                    )
+                )
+            )
+
+        @router.message(Command("contact_set_alias", "contact_set_importance", "contact_set_relation", "contact_set_mode", "contact_add_note", "contact_add_rule"))
+        async def contact_set(message: Message) -> None:
+            if not await _require_owner(message):
+                return
+            parts = (message.text or "").split(maxsplit=2)
+            cmd = parts[0].split("@", 1)[0].lstrip("/")
+            if len(parts) < 3:
+                await message.answer(f"Формат: /{cmd} <telegram_user_id> <значение>")
+                return
+            try:
+                uid = int(parts[1])
+            except ValueError:
+                await message.answer("telegram_user_id должен быть числом")
+                return
+            contact = await self.store.get_contact_by_telegram_id(uid)
             if not contact:
-                await message.answer("Контакт с таким chat_id не найден.")
+                await message.answer("Контакт не найден.")
                 return
-            if command == "note":
-                if len(parts) < 3 or not parts[2].strip():
-                    await message.answer("Формат: /note <chat_id> <заметка>")
-                    return
-                await self.db.set_contact_notes(
-                    str(contact["connection_id"]), chat_id, parts[2].strip()
+            value = parts[2].strip()
+            field_map = {
+                "contact_set_alias": "owner_alias",
+                "contact_set_importance": "importance",
+                "contact_set_relation": "relationship",
+                "contact_set_mode": "ai_mode",
+                "contact_add_note": "manual_owner_notes",
+                "contact_add_rule": "communication_rules",
+            }
+            field = field_map[cmd]
+            if field in {"manual_owner_notes", "communication_rules"}:
+                prev = str(contact.get(field) or "")
+                value = (prev + "\n" + value).strip() if prev else value
+            await self.store.update_contact_fields(int(contact["id"]), **{field: value})
+            await message.answer("Сохранено.")
+
+        @router.message(Command("contact_delete_note"))
+        async def contact_delete_note(message: Message) -> None:
+            if not await _require_owner(message):
+                return
+            parts = (message.text or "").split()
+            if len(parts) < 2:
+                await message.answer("Формат: /contact_delete_note <telegram_user_id>")
+                return
+            uid = int(parts[1])
+            contact = await self.store.get_contact_by_telegram_id(uid)
+            if not contact:
+                await message.answer("Контакт не найден.")
+                return
+            await self.store.update_contact_fields(
+                int(contact["id"]), manual_owner_notes=""
+            )
+            await message.answer("Заметки удалены.")
+
+        @router.message(Command("contact_pause_ai", "contact_resume_ai"))
+        async def contact_pause_resume(message: Message) -> None:
+            if not await _require_owner(message):
+                return
+            parts = (message.text or "").split()
+            cmd = parts[0].split("@", 1)[0].lstrip("/")
+            if len(parts) < 2:
+                await message.answer(f"Формат: /{cmd} <telegram_user_id>")
+                return
+            uid = int(parts[1])
+            contact = await self.store.get_contact_by_telegram_id(uid)
+            if not contact:
+                await message.answer("Контакт не найден.")
+                return
+            conv = await self.store.get_conversation_for_contact(int(contact["id"]))
+            if not conv:
+                await message.answer("Диалог не найден.")
+                return
+            if cmd == "contact_pause_ai":
+                await self.store.set_conversation_mode(
+                    int(conv["id"]), "human", handoff_reason="пауза владельца"
                 )
-                await message.answer("Заметка сохранена.")
+                await message.answer("AI поставлен на паузу для контакта.")
             else:
-                trusted = command == "allow"
-                await self.db.set_contact_trusted(
-                    str(contact["connection_id"]), chat_id, trusted
-                )
+                await self.store.set_conversation_mode(int(conv["id"]), "ai")
+                await message.answer("AI возобновлён для контакта.")
+
+        @router.message(Command("contact_bind"))
+        async def contact_bind(message: Message) -> None:
+            if not await _require_owner(message):
+                return
+            parts = (message.text or "").split(maxsplit=2)
+            if len(parts) < 3:
                 await message.answer(
-                    "Автоответы для контакта разрешены."
-                    if trusted
-                    else "Автоответы для контакта запрещены."
+                    "Формат: /contact_bind <telegram_user_id> <Нормализованное Имя>"
                 )
+                return
+            uid = int(parts[1])
+            name = normalize_person_name(parts[2])
+            bindings = await self.store.get_pending_bindings_by_name(name)
+            if not bindings:
+                await self.store.create_pending_name_binding(
+                    normalized_name=name, candidate_telegram_user_id=uid
+                )
+                bindings = await self.store.get_pending_bindings_by_name(name)
+            for b in bindings:
+                await self.store.set_pending_binding_status(int(b["id"]), "confirmed")
+            contact = await self.store.get_contact_by_telegram_id(uid)
+            if contact and contact.get("business_connection_id"):
+                await apply_andrey_usenko_defaults(
+                    self.store,
+                    uid,
+                    business_connection_id=str(contact["business_connection_id"]),
+                )
+            elif contact:
+                await self.store.update_contact_fields(
+                    int(contact["id"]),
+                    owner_alias=parts[2].strip(),
+                    importance="important",
+                    relationship="работа",
+                    ai_mode="urgent_only",
+                )
+            await message.answer(f"Привязка подтверждена: {uid} → {name}")
+
+        @router.message(Command("contact_unbind"))
+        async def contact_unbind(message: Message) -> None:
+            if not await _require_owner(message):
+                return
+            parts = (message.text or "").split(maxsplit=2)
+            if len(parts) < 3:
+                await message.answer(
+                    "Формат: /contact_unbind <telegram_user_id> <имя>"
+                )
+                return
+            uid = int(parts[1])
+            name = normalize_person_name(parts[2])
+            for b in await self.store.get_pending_bindings_by_name(name):
+                if int(b.get("candidate_telegram_user_id") or 0) == uid:
+                    await self.store.set_pending_binding_status(int(b["id"]), "rejected")
+            await message.answer("Привязка снята.")
+
+        @router.message(Command("alert_ack"))
+        async def alert_ack_cmd(message: Message) -> None:
+            if not await _require_owner(message):
+                return
+            parts = (message.text or "").split()
+            if len(parts) < 2:
+                await message.answer("Формат: /alert_ack <alert_id>")
+                return
+            alert_id = int(parts[1])
+            await self.store.acknowledge_alert(alert_id)
+            self.alert_manager.acknowledge(str(alert_id))
+            await message.answer("Алерт подтверждён.")
 
         @router.callback_query()
         async def owner_callback(callback: CallbackQuery) -> None:
@@ -719,184 +990,48 @@ class Assistant:
                 await callback.answer("Недостаточно прав.", show_alert=True)
                 return
             data = callback.data or ""
-            try:
-                action, raw_id = data.split(":", 1)
-                pending_id = int(raw_id)
-            except (ValueError, TypeError):
-                await callback.answer("Неизвестная кнопка.", show_alert=True)
-                return
-            pending = await self.db.get_pending(pending_id, self.settings.owner_id)
-            if not pending:
-                await callback.answer("Обращение не найдено.", show_alert=True)
-                return
-
-            if action == "send":
-                draft = pending.get("suggested_reply")
-                if not draft:
-                    await callback.answer("У этого обращения нет черновика.", show_alert=True)
-                    return
-                success, result = await self._send_pending_text(pending_id, str(draft))
-            elif action in {"ignore", "mine"}:
-                status = "ignored" if action == "ignore" else "owner_handled"
-                success = await self.db.resolve_pending(
-                    pending_id, status, self.settings.owner_id
-                )
-                result = "Отмечено." if success else "Уже обработано."
-            else:
-                await callback.answer("Неизвестная кнопка.", show_alert=True)
-                return
-
-            await callback.answer(result, show_alert=not success)
-            if success and callback.message:
+            if data.startswith("ack:"):
+                alert_id = data.split(":", 1)[1]
                 with suppress(Exception):
-                    await callback.message.edit_reply_markup(reply_markup=None)
-
-        @router.message()
-        async def owner_custom_reply(message: Message) -> None:
-            if not self._is_owner(message.from_user.id if message.from_user else None):
+                    await self.store.acknowledge_alert(int(alert_id))
+                self.alert_manager.acknowledge(alert_id)
+                await callback.answer("Принято.")
                 return
-            if (
-                message.chat.id != self.settings.owner_id
-                or not message.text
-                or not message.reply_to_message
-            ):
+            if data.startswith("resume_ai:"):
+                conv_id = int(data.split(":", 1)[1])
+                await self.store.set_conversation_mode(conv_id, "ai")
+                await callback.answer("AI возвращён.")
                 return
-            pending = await self.db.get_pending_by_notification(
-                message.reply_to_message.message_id,
-                self.settings.owner_id,
-            )
-            if not pending:
-                return
-            success, result = await self._send_pending_text(
-                int(pending["id"]), message.text
-            )
-            await message.answer(result)
-            if success:
-                with suppress(Exception):
-                    await self.bot.edit_message_reply_markup(
-                        chat_id=self.settings.owner_id,
-                        message_id=message.reply_to_message.message_id,
-                        reply_markup=None,
-                    )
-
-    async def _retry_notifications(self) -> None:
-        while not self._stopping.is_set():
-            try:
-                recovered = await self.db.recover_stale_pending(
-                    self.settings.owner_id
-                )
-                if recovered:
-                    logger.error(
-                        "Marked %s stale sends as unknown; owner must inspect chats",
-                        recovered,
-                    )
-                items = await self.db.list_pending(
-                    self.settings.owner_id,
-                    limit=20,
-                    only_unnotified=True,
-                )
-                for item in items:
-                    try:
-                        await self._notify_owner(item)
-                    except Exception:
-                        logger.exception(
-                            "Notification retry failed for pending %s", item["id"]
-                        )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("Pending notification worker failed")
-            try:
-                await asyncio.wait_for(self._stopping.wait(), timeout=30)
-            except TimeoutError:
-                pass
-
-    async def _process_inbox(self) -> None:
-        while not self._stopping.is_set():
-            try:
-                items = await self.db.list_unprocessed_incoming(
-                    self.settings.owner_id,
-                    limit=20,
-                )
-                if not items:
-                    self._inbox_wakeup.clear()
-                    try:
-                        await asyncio.wait_for(self._inbox_wakeup.wait(), timeout=10)
-                    except TimeoutError:
-                        pass
-                    continue
-                for item in items:
-                    if self._stopping.is_set():
-                        break
-                    try:
-                        await self._process_incoming(item)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        logger.exception(
-                            "Inbox processing failed for %s/%s; will retry",
-                            item["chat_id"],
-                            item["telegram_message_id"],
-                        )
-                if not self._stopping.is_set():
-                    await asyncio.sleep(1)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("Inbox worker failed")
-                await asyncio.sleep(5)
-
-    async def _monitor_instance_lock(self, dispatcher: Dispatcher) -> None:
-        while not self._stopping.is_set():
-            try:
-                await asyncio.wait_for(self._stopping.wait(), timeout=5)
-                continue
-            except TimeoutError:
-                pass
-            if await self.db.instance_lock_healthy():
-                continue
-            logger.critical(
-                "PostgreSQL instance lock was lost; stopping to prevent duplicate replies"
-            )
-            self._stopping.set()
-            self._inbox_wakeup.set()
-            with suppress(RuntimeError):
-                await dispatcher.stop_polling()
-            return
+            await callback.answer("Неизвестная кнопка.")
 
     async def run(self) -> None:
         web_runner = None
-        notification_task: asyncio.Task[None] | None = None
-        inbox_task: asyncio.Task[None] | None = None
-        lock_monitor_task: asyncio.Task[None] | None = None
         try:
-            await self.db.connect(
-                owner_id=self.settings.owner_id,
-                initially_paused=not self.settings.auto_reply_enabled,
-            )
-            recovered = await self.db.recover_all_processing(self.settings.owner_id)
-            if recovered:
-                logger.error(
-                    "Marked %s interrupted sends as unknown; inspect their chats",
-                    recovered,
+            await self.store.connect()
+            await seed_pending_andrey_usenko_profile(self.store)
+            with suppress(Exception):
+                await self.store.prune_old_working_memory(
+                    self.settings.memory_retention_days
                 )
-            web_runner = await start_webserver(self.settings.port, self.db.healthy)
+            web_runner = await start_webserver(self.settings.port, self._health)
             dispatcher = Dispatcher()
             dispatcher.include_router(self.router)
-            notification_task = asyncio.create_task(
-                self._retry_notifications(),
-                name="pending-notification-retry",
-            )
-            inbox_task = asyncio.create_task(
-                self._process_inbox(),
-                name="durable-inbox-worker",
-            )
-            lock_monitor_task = asyncio.create_task(
-                self._monitor_instance_lock(dispatcher),
-                name="instance-lock-monitor",
-            )
+
+            # Capture update_id via middleware-like outer handler
+            @dispatcher.update.outer_middleware()
+            async def dedupe_middleware(handler, event: Update, data):
+                if event.update_id is not None:
+                    if await self.store.is_update_processed(event.update_id):
+                        return None
+                result = await handler(event, data)
+                # Business messages mark themselves; still mark generic updates lightly
+                if event.business_message and event.update_id is not None:
+                    # already marked inside handler; ok
+                    pass
+                return result
+
             await self.bot.delete_webhook(drop_pending_updates=False)
-            logger.info("Telegram Business assistant started")
+            logger.info("Telegram Business neuroagent started")
             await dispatcher.start_polling(
                 self.bot,
                 allowed_updates=dispatcher.resolve_used_update_types(),
@@ -905,24 +1040,14 @@ class Assistant:
             )
         finally:
             self._stopping.set()
-            self._inbox_wakeup.set()
-            workers = [
-                task
-                for task in (inbox_task, notification_task, lock_monitor_task)
-                if task is not None
-            ]
-            if workers:
-                done, pending = await asyncio.wait(workers, timeout=40)
-                for task in pending:
-                    task.cancel()
-                await asyncio.gather(*done, *pending, return_exceptions=True)
+            self.alert_manager.shutdown()
             if web_runner:
                 with suppress(Exception):
                     await web_runner.cleanup()
             with suppress(Exception):
-                await self.llm.close()
+                await self.syntx.close()
             with suppress(Exception):
-                await self.db.close()
+                await self.store.close()
             with suppress(Exception):
                 await self.bot.session.close()
 

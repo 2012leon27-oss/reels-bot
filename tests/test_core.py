@@ -1,3 +1,5 @@
+"""Legacy core tests kept for decision/policy/context compatibility."""
+
 import os
 import tempfile
 import unittest
@@ -11,10 +13,9 @@ from policy import escalation_reason
 
 
 VALID_ENV = {
-    "BOT_TOKEN": "test-token",
-    "OWNER_ID": "123456",
-    "DATABASE_URL": "postgresql://localhost/test",
-    "LLM_API_KEY": "test-key",
+    "TELEGRAM_BOT_TOKEN": "test-token",
+    "OWNER_TELEGRAM_ID": "123456",
+    "DATABASE_URL": "sqlite:///data/test.db",
 }
 
 
@@ -23,11 +24,10 @@ class SettingsTests(unittest.TestCase):
         with patch.dict(os.environ, VALID_ENV, clear=True):
             settings = Settings.from_env()
         self.assertFalse(settings.auto_reply_enabled)
-        self.assertTrue(settings.escalate_unknown_contacts)
         self.assertEqual(settings.owner_id, 123456)
 
     def test_missing_secret_fails_fast(self) -> None:
-        with patch.dict(os.environ, {"OWNER_ID": "1"}, clear=True):
+        with patch.dict(os.environ, {"OWNER_TELEGRAM_ID": "1"}, clear=True):
             with self.assertRaises(ConfigurationError):
                 Settings.from_env()
 

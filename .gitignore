@@ -1,4 +1,11 @@
+data/*
+!data/contacts/
+data/contacts/*
+!data/contacts/profile.yaml.example
+syntx_browser_profile/
 .env
+*.db
+logs/
 .venv/
 __pycache__/
 *.py[cod]

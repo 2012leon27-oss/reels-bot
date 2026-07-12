@@ -1,0 +1,21 @@
+[Unit]
+Description=Telegram Business neuroagent bot
+After=network-online.target syntx-bridge.service
+Wants=network-online.target
+# Bridge is optional at boot — bot can escalate if SyntX is down
+Wants=syntx-bridge.service
+
+[Service]
+Type=simple
+User=tgbot
+Group=tgbot
+WorkingDirectory=/opt/telegram-business-bot
+EnvironmentFile=/opt/telegram-business-bot/.env
+ExecStart=/opt/telegram-business-bot/venv/bin/python bot.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/opt/telegram-business-bot/logs/telegram-business-bot.log
+StandardError=append:/opt/telegram-business-bot/logs/telegram-business-bot.log
+
+[Install]
+WantedBy=multi-user.target
