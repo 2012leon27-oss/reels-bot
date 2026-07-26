@@ -1,0 +1,34 @@
+services:
+  - type: web
+    name: thought-architect
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: APP_ACCESS_KEY
+        generateValue: true
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: llama-3.3-70b-versatile
+      - key: TRANSCRIPTION_MODEL
+        value: whisper-large-v3-turbo
+      - key: DATABASE_URL
+        fromDatabase:
+          name: thought-architect-db
+          property: connectionString
+      - key: BOT_TOKEN
+        sync: false
+
+databases:
+  - name: thought-architect-db
+    plan: basic-256mb
+    databaseName: thought_architect
+    user: thought_architect
