@@ -11,6 +11,9 @@ secrets/transcription.key
 !secrets/.gitkeep
 !secrets/base_url.txt
 !secrets/model.txt
+!secrets/CURSOR_API_KEY.txt
+notes/*.md
+!notes/.gitkeep
 *.sqlite
 *.sqlite3
 .DS_Store
