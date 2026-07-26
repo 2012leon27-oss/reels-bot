@@ -341,8 +341,10 @@
     elements.recordLabel.textContent = "Подключаю микрофон…";
     elements.structure.disabled = true;
     elements.audioUpload.disabled = true;
+    let acquiredStream = null;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      acquiredStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = acquiredStream;
       if (state.recordingState !== "starting") {
         stream.getTracks().forEach((track) => track.stop());
         return;
@@ -398,6 +400,7 @@
       state.timer = setInterval(updateRecordingTime, 250);
       updateRecordingTime();
     } catch (error) {
+      acquiredStream?.getTracks().forEach((track) => track.stop());
       state.stream?.getTracks().forEach((track) => track.stop());
       state.recordingState = "idle";
       state.recorder = null;
