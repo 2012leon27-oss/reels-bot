@@ -56,13 +56,23 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(shared["share_source"])
         self.assertIsNotNone(await database.get_public_note(note["share_id"]))
 
-        await database.set_note_sharing(
+        revoked = await database.set_note_sharing(
             note["id"],
             "test:owner",
             enabled=False,
             include_source=False,
         )
         self.assertIsNone(await database.get_public_note(note["share_id"]))
+        self.assertNotEqual(revoked["share_id"], note["share_id"])
+
+        await database.set_note_sharing(
+            note["id"],
+            "test:owner",
+            enabled=True,
+            include_source=False,
+        )
+        self.assertIsNone(await database.get_public_note(note["share_id"]))
+        self.assertIsNotNone(await database.get_public_note(revoked["share_id"]))
 
 
 if __name__ == "__main__":

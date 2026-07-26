@@ -334,12 +334,15 @@ async def set_note_sharing(
     enabled: bool,
     include_source: bool,
 ) -> dict[str, Any] | None:
+    rotated_share_id = secrets.token_urlsafe(9)
     if _pool:
         async with _pool.acquire() as connection:
             row = await connection.fetchrow(
                 """
                 UPDATE thought_notes
-                SET share_enabled = $3, share_source = $4
+                SET share_enabled = $3,
+                    share_source = $4,
+                    share_id = CASE WHEN $3 THEN share_id ELSE $5 END
                 WHERE id = $1 AND owner_id = $2
                 RETURNING *
                 """,
@@ -347,6 +350,7 @@ async def set_note_sharing(
                 owner_id,
                 enabled,
                 include_source if enabled else False,
+                rotated_share_id,
             )
             return _serialize_row(dict(row)) if row else None
 
@@ -355,12 +359,16 @@ async def set_note_sharing(
             connection.execute(
                 """
                 UPDATE thought_notes
-                SET share_enabled = ?, share_source = ?
+                SET share_enabled = ?,
+                    share_source = ?,
+                    share_id = CASE WHEN ? THEN share_id ELSE ? END
                 WHERE id = ? AND owner_id = ?
                 """,
                 (
                     int(enabled),
                     int(include_source if enabled else False),
+                    int(enabled),
+                    rotated_share_id,
                     note_id,
                     owner_id,
                 ),

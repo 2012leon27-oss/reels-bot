@@ -26,6 +26,8 @@ services:
           property: connectionString
       - key: BOT_TOKEN
         sync: false
+      - key: TELEGRAM_ALLOWED_USER_IDS
+        sync: false
 
 databases:
   - name: thought-architect-db

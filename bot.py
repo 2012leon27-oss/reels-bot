@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import html
-import io
 import logging
+import tempfile
+import time
+from collections import defaultdict, deque
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
@@ -30,6 +32,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 dispatcher = Dispatcher()
+telegram_audio_slots = asyncio.Semaphore(2)
+telegram_quota: dict[tuple[int, str], deque[float]] = defaultdict(deque)
+
+
+def consume_quota(user_id: int, operation: str) -> bool:
+    limit = 20 if operation == "audio" else 60
+    window = 3600
+    now = time.monotonic()
+    events = telegram_quota[(user_id, operation)]
+    while events and events[0] <= now - window:
+        events.popleft()
+    if len(events) >= limit:
+        return False
+    events.append(now)
+    return True
 
 
 def mini_app_keyboard() -> InlineKeyboardMarkup | None:
@@ -86,6 +103,11 @@ async def reject_unlisted(message: Message) -> None:
 async def process_text(message: Message, source_text: str) -> None:
     if not message_allowed(message):
         await reject_unlisted(message)
+        return
+    if not consume_quota(message.from_user.id, "structure"):
+        await message.answer(
+            "Лимит структурирования на этот час исчерпан. Попробуйте немного позже."
+        )
         return
     if len(source_text) > settings.max_text_chars:
         await message.answer(
@@ -164,6 +186,11 @@ async def audio_message(message: Message) -> None:
     if not message_allowed(message):
         await reject_unlisted(message)
         return
+    if not consume_quota(message.from_user.id, "audio"):
+        await message.answer(
+            "Лимит расшифровок на этот час исчерпан. Попробуйте немного позже."
+        )
+        return
     attachment = message.voice or message.audio
     if not attachment:
         return
@@ -174,14 +201,22 @@ async def audio_message(message: Message) -> None:
 
     status = await message.answer("Расшифровываю запись…")
     try:
-        file = await message.bot.get_file(attachment.file_id)
-        destination = io.BytesIO()
-        await message.bot.download_file(file.file_path, destination=destination)
-        filename = getattr(message.audio, "file_name", None) or "telegram-voice.ogg"
-        content_type = getattr(message.audio, "mime_type", None) or "audio/ogg"
-        transcript = await transcribe_audio(
-            destination.getvalue(), filename=filename, content_type=content_type
-        )
+        async with telegram_audio_slots:
+            file = await message.bot.get_file(attachment.file_id)
+            with tempfile.SpooledTemporaryFile(
+                max_size=4 * 1024 * 1024
+            ) as destination:
+                await message.bot.download_file(file.file_path, destination=destination)
+                destination.seek(0)
+                filename = (
+                    getattr(message.audio, "file_name", None) or "telegram-voice.ogg"
+                )
+                content_type = (
+                    getattr(message.audio, "mime_type", None) or "audio/ogg"
+                )
+                transcript = await transcribe_audio(
+                    destination, filename=filename, content_type=content_type
+                )
         await status.delete()
         await process_text(message, transcript)
     except Exception:

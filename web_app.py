@@ -314,6 +314,8 @@ async def on_startup(app: web.Application) -> None:
             missing.append("DATABASE_URL")
         if not settings.app_access_key and not settings.bot_token:
             missing.append("APP_ACCESS_KEY or BOT_TOKEN")
+        if settings.bot_token and not settings.allowed_telegram_ids:
+            missing.append("TELEGRAM_ALLOWED_USER_IDS or ADMIN_ID")
         if missing:
             raise RuntimeError(
                 "Production configuration is incomplete: " + ", ".join(missing)

@@ -42,13 +42,12 @@
     note: null,
     recorder: null,
     stream: null,
-    chunks: [],
+    recordingState: "idle",
     startedAt: 0,
     timer: null,
     toastTimer: null,
     pendingAudio: null,
     retryAction: null,
-    recordedBytes: 0,
     historyReturnFocus: null,
   };
 
@@ -332,45 +331,66 @@
   }
 
   async function startRecording() {
+    if (state.recordingState !== "idle") return;
     if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
       showToast("Браузер не поддерживает запись. Используйте кнопку «Аудиофайл».");
       return;
     }
+    state.recordingState = "starting";
+    elements.record.disabled = true;
+    elements.recordLabel.textContent = "Подключаю микрофон…";
+    elements.structure.disabled = true;
+    elements.audioUpload.disabled = true;
     try {
-      state.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (state.recordingState !== "starting") {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
       const mimeType = supportedMimeType();
-      state.recorder = new MediaRecorder(state.stream, mimeType ? { mimeType } : undefined);
-      state.chunks = [];
-      state.recordedBytes = 0;
-      state.recorder.addEventListener("dataavailable", (event) => {
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+      const chunks = [];
+      let recordedBytes = 0;
+      state.stream = stream;
+      state.recorder = recorder;
+      recorder.addEventListener("dataavailable", (event) => {
         if (event.data.size) {
-          state.chunks.push(event.data);
-          state.recordedBytes += event.data.size;
-          if (state.recordedBytes > 24 * 1024 * 1024 && state.recorder.state === "recording") {
+          chunks.push(event.data);
+          recordedBytes += event.data.size;
+          if (recordedBytes > 24 * 1024 * 1024 && recorder.state === "recording") {
             showToast("Запись достигла лимита 24 МБ и остановлена.");
             stopRecording();
           }
         }
       });
-      state.recorder.addEventListener("stop", () => {
-        const type = state.recorder.mimeType || "audio/webm";
+      recorder.addEventListener("stop", () => {
+        state.recordingState = "idle";
+        state.recorder = null;
+        state.stream = null;
+        const type = recorder.mimeType || "audio/webm";
         const extension = type.includes("mp4") ? "m4a" : type.includes("ogg") ? "ogg" : "webm";
-        const blob = new Blob(state.chunks, { type });
+        const blob = new Blob(chunks, { type });
         transcribeFile(new File([blob], `voice-${Date.now()}.${extension}`, { type }));
       });
-      state.recorder.addEventListener("error", () => {
-        state.stream?.getTracks().forEach((track) => track.stop());
+      recorder.addEventListener("error", () => {
+        stream.getTracks().forEach((track) => track.stop());
+        state.recordingState = "idle";
+        state.recorder = null;
+        state.stream = null;
         clearInterval(state.timer);
         elements.record.classList.remove("recording");
+        elements.record.disabled = false;
         elements.recordLabel.textContent = "Записать голос";
         elements.recordTime.hidden = true;
         elements.structure.disabled = false;
         elements.audioUpload.disabled = false;
         showToast("Запись прервалась. Попробуйте ещё раз.");
       });
-      state.recorder.start(1000);
+      recorder.start(1000);
+      state.recordingState = "recording";
       state.startedAt = Date.now();
       elements.record.classList.add("recording");
+      elements.record.disabled = false;
       elements.recordLabel.textContent = "Остановить";
       elements.recordTime.hidden = false;
       elements.structure.disabled = true;
@@ -379,6 +399,11 @@
       updateRecordingTime();
     } catch (error) {
       state.stream?.getTracks().forEach((track) => track.stop());
+      state.recordingState = "idle";
+      state.recorder = null;
+      state.stream = null;
+      elements.record.disabled = false;
+      elements.recordLabel.textContent = "Записать голос";
       elements.structure.disabled = false;
       elements.audioUpload.disabled = false;
       showToast(error.name === "NotAllowedError"
@@ -388,14 +413,15 @@
   }
 
   function stopRecording() {
-    if (state.recorder?.state === "recording") state.recorder.stop();
+    if (state.recordingState !== "recording" || !state.recorder) return;
+    state.recordingState = "stopping";
+    elements.record.disabled = true;
+    if (state.recorder.state === "recording") state.recorder.stop();
     state.stream?.getTracks().forEach((track) => track.stop());
     clearInterval(state.timer);
     elements.record.classList.remove("recording");
     elements.recordLabel.textContent = "Записать голос";
     elements.recordTime.hidden = true;
-    elements.structure.disabled = false;
-    elements.audioUpload.disabled = false;
   }
 
   function updateRecordingTime() {
@@ -652,9 +678,9 @@
   });
   elements.structure.addEventListener("click", structureCurrentText);
   elements.record.addEventListener("click", () => {
-    if (state.recorder?.state === "recording") stopRecording();
+    if (state.recordingState === "recording") stopRecording();
     else if (state.pendingAudio) transcribeFile(state.pendingAudio);
-    else startRecording();
+    else if (state.recordingState === "idle") startRecording();
   });
   elements.audioUpload.addEventListener("change", () => transcribeFile(elements.audioUpload.files[0]));
   elements.copy.addEventListener("click", () => {
@@ -689,6 +715,7 @@
     }
   });
   window.addEventListener("pagehide", () => {
+    if (state.recordingState === "starting") state.recordingState = "idle";
     if (state.recorder?.state === "recording") state.recorder.stop();
     state.stream?.getTracks().forEach((track) => track.stop());
   });
