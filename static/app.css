@@ -942,34 +942,119 @@ noscript {
 
 @media (max-width: 620px) {
   .shell {
-    width: calc(100% - 20px);
+    width: calc(100% - 16px);
+    padding-bottom: env(safe-area-inset-bottom);
   }
 
   .topbar {
-    min-height: 76px;
+    min-height: 68px;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    background: rgba(248, 246, 239, 0.92);
+    backdrop-filter: blur(12px);
   }
 
-  .topbar-actions {
-    gap: 4px;
+  .brand small {
+    display: none;
   }
 
   .hero {
-    padding-top: 52px;
+    padding: 28px 0 24px;
   }
 
   .hero h1 {
-    margin-top: 16px;
-    font-size: clamp(3rem, 15.5vw, 4.7rem);
+    margin-top: 12px;
+    font-size: clamp(2.4rem, 12vw, 3.6rem);
+    line-height: 0.95;
   }
 
   .hero p {
-    font-size: 15px;
+    font-size: 14px;
+    line-height: 1.55;
+  }
+
+  .eyebrow {
+    font-size: 10px;
   }
 
   .composer,
   .result,
-  .shared-note {
-    padding: 25px 20px;
+  .shared-note,
+  .loading,
+  .principles {
+    padding: 18px 14px;
+    border-radius: 20px;
+  }
+
+  .card h2 {
+    font-size: 22px;
+  }
+
+  .principles {
+    order: 2;
+  }
+
+  .composer {
+    order: 1;
+  }
+
+  .workspace {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .composer-actions,
+  .voice-actions {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+
+  .voice-button,
+  .upload-button,
+  .primary-button {
+    min-height: 52px;
+    width: 100%;
+    font-size: 14px;
+  }
+
+  textarea {
+    min-height: 220px;
+    font-size: 16px;
+    padding: 14px;
+  }
+
+  .result-toolbar > div {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    width: 100%;
+  }
+
+  .share-button,
+  .text-button {
+    min-height: 44px;
+  }
+
+  .history-panel {
+    width: 100vw;
+    padding: max(20px, env(safe-area-inset-top))
+      max(16px, env(safe-area-inset-right))
+      max(20px, env(safe-area-inset-bottom))
+      16px;
+  }
+
+  footer {
+    font-size: 10px;
+    margin-top: 36px;
+  }
+
+  .toast {
+    left: 12px;
+    right: 12px;
+    max-width: none;
   }
 
   .card-heading {
@@ -984,11 +1069,6 @@ noscript {
     width: 100%;
   }
 
-  textarea {
-    min-height: 260px;
-    padding: 18px;
-  }
-
   .input-meta span:first-child {
     display: none;
   }
@@ -997,43 +1077,8 @@ noscript {
     justify-content: flex-end;
   }
 
-  .composer-actions {
-    display: grid;
-  }
-
-  .voice-actions {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-  }
-
-  .primary-button {
-    width: 100%;
-  }
-
-  .principles {
-    padding: 28px 22px;
-  }
-
-  .principles ul {
-    grid-template-columns: 1fr;
-    gap: 0;
-  }
-
-  .principles li {
-    display: grid;
-  }
-
-  .principles li > span {
-    margin: 0;
-  }
-
   .result-toolbar {
     display: grid;
-  }
-
-  .result-toolbar > div {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
   }
 
   .share-button {
@@ -1041,19 +1086,15 @@ noscript {
   }
 
   article {
-    padding-top: 32px;
+    padding-top: 28px;
   }
 
   article h1 {
-    font-size: 2.5rem;
+    font-size: 2.2rem;
   }
 
   .fact-grid {
     grid-template-columns: 1fr;
-  }
-
-  .loading {
-    padding: 28px 20px;
   }
 
   footer {

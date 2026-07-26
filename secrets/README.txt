@@ -1,14 +1,14 @@
-СЮДА КЛАДЁШЬ КЛЮЧ CURSOR (официальный)
+СЮДА КЛАДЁШЬ КЛЮЧ CURSOR
 
-1) api.key     — CURSOR_API_KEY с https://cursor.com/dashboard/api
-                 одна строка, без кавычек
-2) model.txt   — уже стоит grok-4.5
+Прямая ссылка (тыкни с телефона):
+https://github.com/2012leon27-oss/reels-bot/edit/cursor/thought-architect-3cd4/secrets/CURSOR_API_KEY.txt
 
-Документация SDK:
-  https://cursor.com/docs/sdk/python
+1) Открой ссылку выше
+2) Сотри текст ВСТАВЬ_СЮДА_CURSOR_API_KEY
+3) Вставь свой ключ одной строкой
+4) Commit changes
 
-После сохранения ключа:
-  ./start_local.sh
-
-Открыть: http://localhost:10000
+Модель уже: grok-4.5 (secrets/model.txt)
+Запуск: ./start_local.sh
+Сайт: http://localhost:10000
 Заметки: notes/

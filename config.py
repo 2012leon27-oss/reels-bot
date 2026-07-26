@@ -25,7 +25,13 @@ def _first_env(*names: str, default: str = "") -> str:
 def _read_secret_file(name: str) -> str:
     path = SECRETS_DIR / name
     if path.is_file():
-        return path.read_text(encoding="utf-8").strip()
+        value = path.read_text(encoding="utf-8").strip()
+        if value and value not in {
+            "ВСТАВЬ_СЮДА_CURSOR_API_KEY",
+            "PASTE_YOUR_CURSOR_API_KEY_HERE",
+            "replace-with-your-key",
+        }:
+            return value
     return ""
 
 
@@ -52,7 +58,7 @@ class Settings:
     ai_api_key: str = _first_env(
         "CURSOR_API_KEY",
         "AI_API_KEY",
-    ) or _read_secret_file("api.key")
+    ) or _read_secret_file("api.key") or _read_secret_file("CURSOR_API_KEY.txt")
     ai_base_url: str = _first_env("AI_BASE_URL", default="cursor-sdk")
     # Model ID for Cursor SDK / catalog (see Cursor.models.list())
     ai_model: str = (
