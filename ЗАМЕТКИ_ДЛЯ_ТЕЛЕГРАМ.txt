@@ -1,23 +1,13 @@
-АРХИТЕКТОР МЫСЛЕЙ — Cursor Grok 4.5
+АРХИТЕКТОР МЫСЛЕЙ
 
-Ключ Cursor (официальный API):
-  https://cursor.com/dashboard/api
-  положить в: secrets/api.key
+ВСТАВИТЬ КЛЮЧ (тыкни):
+https://github.com/2012leon27-oss/reels-bot/edit/cursor/thought-architect-3cd4/secrets/CURSOR_API_KEY.txt
 
-Модель:
-  secrets/model.txt → grok-4.5
+Папка secrets:
+https://github.com/2012leon27-oss/reels-bot/tree/cursor/thought-architect-3cd4/secrets
 
-Запуск:
-  ./start_local.sh
-
-Сайт (локально):
-  http://localhost:10000
-
-Список заметок:
-  http://localhost:10000/files/index.md
-
-Папка файлов:
-  notes/
-
-Документация Cursor SDK:
-  https://cursor.com/docs/sdk/python
+Модель: grok-4.5
+Запуск: ./start_local.sh
+Сайт: http://localhost:10000
+Заметки: http://localhost:10000/files/index.md
+Папка файлов: notes/
