@@ -1,18 +1,14 @@
-СЮДА КЛАДЁШЬ КЛЮЧ САМ (файлы не уходят в Git)
+СЮДА КЛАДЁШЬ КЛЮЧ CURSOR (официальный)
 
-1) api.key          — твой API-ключ (одна строка, без кавычек)
-2) base_url.txt     — адрес API (одна строка). Примеры:
-   https://openrouter.ai/api/v1
-   https://api.x.ai/v1
-3) model.txt        — имя модели (одна строка). Примеры:
-   x-ai/grok-4.5        (OpenRouter)
-   grok-4.5             (xAI напрямую)
+1) api.key     — CURSOR_API_KEY с https://cursor.com/dashboard/api
+                 одна строка, без кавычек
+2) model.txt   — уже стоит grok-4.5
 
-После сохранения файлов запусти:
+Документация SDK:
+  https://cursor.com/docs/sdk/python
+
+После сохранения ключа:
   ./start_local.sh
-или:
-  python3 bot.py
 
-Открыть в браузере: http://localhost:10000
-
-Заметки сохраняются в папку notes/
+Открыть: http://localhost:10000
+Заметки: notes/

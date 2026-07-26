@@ -1,4 +1,4 @@
-"""Runtime configuration for the Thought Architect application."""
+"""Runtime configuration for Thought Architect (Cursor SDK + Grok 4.5)."""
 
 from __future__ import annotations
 
@@ -48,29 +48,23 @@ class Settings:
     database_url: str = _first_env("DATABASE_URL")
     sqlite_path: str = _first_env("SQLITE_PATH", default="data/thoughts.db")
 
+    # Official Cursor API key: https://cursor.com/dashboard/api
     ai_api_key: str = _first_env(
+        "CURSOR_API_KEY",
         "AI_API_KEY",
-        "OPENROUTER_API_KEY",
-        "GROQ_API_KEY",
-        "GROK_API_KEY",
-        "GROG_API_KEY",
-        "XAI_API_KEY",
     ) or _read_secret_file("api.key")
-    ai_base_url: str = (
-        _first_env("AI_BASE_URL")
-        or _read_secret_file("base_url.txt")
-        or "https://openrouter.ai/api/v1"
-    )
+    ai_base_url: str = _first_env("AI_BASE_URL", default="cursor-sdk")
+    # Model ID for Cursor SDK / catalog (see Cursor.models.list())
     ai_model: str = (
-        _first_env("AI_MODEL", "GROQ_MODEL", "GROK_MODEL", "GROG_MODEL")
+        _first_env("CURSOR_MODEL", "AI_MODEL")
         or _read_secret_file("model.txt")
-        or "x-ai/grok-4.5"
+        or "grok-4.5"
     )
+
+    # Optional Whisper (Groq) — only for browser voice; text works without it.
     transcription_api_key: str = _first_env(
         "TRANSCRIPTION_API_KEY",
         "GROQ_API_KEY",
-        "GROK_API_KEY",
-        "GROG_API_KEY",
     ) or _read_secret_file("transcription.key")
     transcription_base_url: str = _first_env(
         "TRANSCRIPTION_BASE_URL", default="https://api.groq.com/openai/v1"

@@ -136,13 +136,15 @@ async def index(request: web.Request) -> web.FileResponse:
 
 async def health(request: web.Request) -> web.Response:
     database = await database_health()
-    configured = bool(settings.ai_api_key and settings.transcription_api_key)
+    configured = bool(settings.ai_api_key)
     status = 200 if database["status"] == "ok" and configured else 503
     return web.json_response(
         {
             "status": "ok" if status == 200 else "degraded",
             "database": database,
             "ai_configured": bool(settings.ai_api_key),
+            "ai_model": settings.ai_model,
+            "ai_provider": "cursor-sdk",
             "transcription_configured": bool(settings.transcription_api_key),
         },
         status=status,
@@ -318,9 +320,7 @@ async def on_startup(app: web.Application) -> None:
     if settings.production:
         missing = []
         if not settings.ai_api_key:
-            missing.append("GROQ_API_KEY or AI_API_KEY")
-        if not settings.transcription_api_key:
-            missing.append("GROQ_API_KEY or TRANSCRIPTION_API_KEY")
+            missing.append("CURSOR_API_KEY (secrets/api.key)")
         if not settings.database_url:
             missing.append("DATABASE_URL")
         if not settings.app_access_key and not settings.bot_token:

@@ -1,31 +1,23 @@
-АРХИТЕКТОР МЫСЛЕЙ — локально
+АРХИТЕКТОР МЫСЛЕЙ — Cursor Grok 4.5
 
-КЛЮЧ API (положить самому):
-  папка проекта → secrets/api.key
-  (одна строка, без пробелов и кавычек)
+Ключ Cursor (официальный API):
+  https://cursor.com/dashboard/api
+  положить в: secrets/api.key
 
-Модель Grok 4.5:
-  secrets/model.txt  → x-ai/grok-4.5  (OpenRouter)
-  или grok-4.5       (если base_url = https://api.x.ai/v1)
+Модель:
+  secrets/model.txt → grok-4.5
 
-Адрес API:
-  secrets/base_url.txt
-
-ЗАПУСК:
+Запуск:
   ./start_local.sh
-  или: python3 bot.py
 
-САЙТ (только на твоём компьютере):
+Сайт (локально):
   http://localhost:10000
 
-СПИСОК ВСЕХ ЗАМЕТОК:
+Список заметок:
   http://localhost:10000/files/index.md
 
-ПАПКА С ФАЙЛАМИ НА ДИСКЕ:
-  notes/   (внутри проекта)
+Папка файлов:
+  notes/
 
-ПОСЛЕ «Собрать структуру» ссылка на файл:
-  http://localhost:10000/files/дата_название.md
-
-Голос без Whisper: вставь текст из Telegram вручную.
-Пароль не нужен — только локально.
+Документация Cursor SDK:
+  https://cursor.com/docs/sdk/python

@@ -1,7 +1,7 @@
-"""AI structuring and speech-to-text services.
+"""Cursor SDK client — official CURSOR_API_KEY + Grok 4.5.
 
-The text model uses an OpenAI-compatible endpoint. The default points to Groq,
-while ``AI_BASE_URL``/``AI_MODEL`` can target another compatible provider.
+Docs: https://cursor.com/docs/sdk/python
+Keys: https://cursor.com/dashboard/api
 """
 
 from __future__ import annotations
@@ -9,9 +9,9 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from typing import Any, BinaryIO
-
-from openai import AsyncOpenAI
+import tempfile
+from pathlib import Path
+from typing import Any
 
 from config import settings
 from prompts import STRUCTURING_SYSTEM_PROMPT
@@ -23,32 +23,14 @@ MODES = {
     "content": "Оформи как контентный замысел: тезис, аудитория, смысловые блоки и план создания.",
     "personal": "Оформи как личную заметку: наблюдения, выводы, намерения и вопросы.",
 }
-_structure_slots = asyncio.Semaphore(3)
-_transcription_slots = asyncio.Semaphore(2)
 
 
 class AIConfigurationError(RuntimeError):
-    """Raised when a required AI provider credential is not configured."""
+    pass
 
 
 class AIResponseError(RuntimeError):
-    """Raised when the model returns an unusable response."""
-
-
-def _client(api_key: str, base_url: str) -> AsyncOpenAI:
-    if not api_key:
-        raise AIConfigurationError(
-            "API key is missing. Put your key in secrets/api.key"
-        )
-    default_headers = None
-    if "openrouter.ai" in base_url:
-        default_headers = {
-            "HTTP-Referer": "http://localhost:10000",
-            "X-Title": "Thought Architect",
-        }
-    return AsyncOpenAI(
-        api_key=api_key, base_url=base_url, default_headers=default_headers
-    )
+    pass
 
 
 def _as_string_list(value: Any) -> list[str]:
@@ -58,7 +40,6 @@ def _as_string_list(value: Any) -> list[str]:
 
 
 def normalize_structure(value: dict[str, Any]) -> dict[str, Any]:
-    """Normalize provider output into the stable application contract."""
     raw_actions = value.get("actions")
     actions: list[dict[str, str]] = []
     if isinstance(raw_actions, list):
@@ -97,6 +78,11 @@ def parse_structure_response(content: str) -> dict[str, Any]:
     fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", cleaned, re.DOTALL)
     if fenced:
         cleaned = fenced.group(1)
+    # Agent may wrap JSON with prose — extract first object.
+    if not cleaned.startswith("{"):
+        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if match:
+            cleaned = match.group(0)
     try:
         value = json.loads(cleaned)
     except json.JSONDecodeError as exc:
@@ -106,40 +92,86 @@ def parse_structure_response(content: str) -> dict[str, Any]:
     return normalize_structure(value)
 
 
+def _extract_run_text(result: Any) -> str:
+    if result is None:
+        return ""
+    if isinstance(result, str):
+        return result
+    for attr in ("result", "text"):
+        value = getattr(result, attr, None)
+        if callable(value):
+            try:
+                value = value()
+            except TypeError:
+                pass
+        if isinstance(value, str) and value.strip():
+            return value
+    return str(result)
+
+
+def _call_cursor_agent(prompt: str) -> str:
+    if not settings.ai_api_key:
+        raise AIConfigurationError(
+            "CURSOR_API_KEY missing. Put it in secrets/api.key "
+            "(from https://cursor.com/dashboard/api)."
+        )
+
+    from cursor_sdk import Agent, AgentOptions, LocalAgentOptions
+
+    with tempfile.TemporaryDirectory(prefix="thought-architect-") as sandbox:
+        # Empty sandbox: agent must not touch the real project.
+        Path(sandbox, "README.txt").write_text(
+            "Sandbox only. Do not edit files. Reply with JSON only.\n",
+            encoding="utf-8",
+        )
+        options = AgentOptions(
+            model=settings.ai_model or "grok-4.5",
+            api_key=settings.ai_api_key,
+            local=LocalAgentOptions(cwd=sandbox, setting_sources=[]),
+        )
+        run_result = Agent.prompt(prompt, options)
+        text = _extract_run_text(run_result)
+        if not text.strip():
+            raise AIResponseError("Cursor agent returned an empty response.")
+        return text
+
+
 async def structure_thoughts(source_text: str, mode: str = "auto") -> dict[str, Any]:
     selected_mode = mode if mode in MODES else "auto"
     prompt = (
+        f"{STRUCTURING_SYSTEM_PROMPT}\n\n"
+        "CRITICAL RUNTIME RULES:\n"
+        "- Do NOT use tools.\n"
+        "- Do NOT read or edit files.\n"
+        "- Do NOT create a plan document on disk.\n"
+        "- Reply with ONE JSON object only. No markdown fences if possible.\n\n"
         f"Режим документа: {selected_mode}. {MODES[selected_mode]}\n\n"
         "Ниже исходная запись. Следуй критическим правилам и ничего не выдумывай.\n\n"
         f"<source>\n{source_text}\n</source>"
     )
-    async with _structure_slots:
-        response = await _client(
-            settings.ai_api_key, settings.ai_base_url
-        ).chat.completions.create(
-            model=settings.ai_model,
-            messages=[
-                {"role": "system", "content": STRUCTURING_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.2,
-            max_tokens=6000,
-            response_format={"type": "json_object"},
-        )
-    content = response.choices[0].message.content
-    if not content:
-        raise AIResponseError("The model returned an empty response.")
-    return parse_structure_response(content)
+    text = await asyncio.to_thread(_call_cursor_agent, prompt)
+    return parse_structure_response(text)
 
 
 async def transcribe_audio(
-    audio: bytes | BinaryIO,
+    audio: bytes | Any,
     *,
     filename: str = "recording.webm",
     content_type: str = "audio/webm",
     language: str | None = None,
 ) -> str:
-    client = _client(settings.transcription_api_key, settings.transcription_base_url)
+    """Optional Whisper via Groq. Structuring uses Cursor SDK separately."""
+    if not settings.transcription_api_key:
+        raise AIConfigurationError(
+            "Голос: либо вставь текст из Telegram, либо положи Whisper-ключ "
+            "в secrets/transcription.key (Groq)."
+        )
+    from openai import AsyncOpenAI
+
+    client = AsyncOpenAI(
+        api_key=settings.transcription_api_key,
+        base_url=settings.transcription_base_url,
+    )
     arguments: dict[str, Any] = {
         "file": (filename, audio, content_type),
         "model": settings.transcription_model,
@@ -148,8 +180,7 @@ async def transcribe_audio(
     }
     if language and re.fullmatch(r"[a-z]{2}", language.lower()):
         arguments["language"] = language.lower()
-    async with _transcription_slots:
-        response = await client.audio.transcriptions.create(**arguments)
+    response = await client.audio.transcriptions.create(**arguments)
     text = str(getattr(response, "text", "") or "").strip()
     if not text:
         raise AIResponseError("Speech recognition returned an empty transcript.")
@@ -157,7 +188,6 @@ async def transcribe_audio(
 
 
 def render_markdown(structured: dict[str, Any], source_text: str) -> str:
-    """Build a portable, lossless Markdown export."""
     parts = [f"# {structured['title']}"]
     if structured.get("summary"):
         parts.extend(["", structured["summary"]])
@@ -192,12 +222,14 @@ def render_markdown(structured: dict[str, Any], source_text: str) -> str:
             parts.extend(["", f"## {heading}", *[f"- {item}" for item in items]])
 
     if structured.get("tags"):
-        parts.extend(["", "## Теги", " ".join(f"`{tag}`" for tag in structured["tags"])])
+        parts.extend(
+            ["", "## Теги", " ".join(f"`{tag}`" for tag in structured["tags"])]
+        )
     parts.extend(["", "---", "", "## Оригинальная запись", "", source_text.strip(), ""])
     return "\n".join(parts)
 
 
-# Compatibility wrapper for callers from older versions of this repository.
+# Compatibility wrapper
 async def ask_grok(user_message: str, history: list | None = None) -> str:
     del history
     structured = await structure_thoughts(user_message)
