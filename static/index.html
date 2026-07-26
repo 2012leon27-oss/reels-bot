@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#111814" />
+    <meta
+      name="description"
+      content="Архитектор мыслей — превращает голос и черновой текст в ясный план без потери смысла."
+    />
+    <title>Архитектор мыслей</title>
+    <link rel="stylesheet" href="/static/app.css" />
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <div class="ambient ambient-one"></div>
+    <div class="ambient ambient-two"></div>
+
+    <div class="shell">
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="На главную">
+          <span class="brand-mark">М</span>
+          <span>
+            <strong>Архитектор мыслей</strong>
+            <small>из потока — в ясность</small>
+          </span>
+        </a>
+        <div class="topbar-actions">
+          <button class="icon-button" id="history-button" type="button" aria-label="История">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M3 12a9 9 0 1 0 3-6.7L3 8" />
+              <path d="M3 3v5h5M12 7v5l3 2" />
+            </svg>
+          </button>
+          <button class="icon-button" id="access-button" type="button" aria-label="Доступ">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="8" cy="15" r="4" />
+              <path d="m11 12 8-8M15 4l3 3M14 9l2 2" />
+            </svg>
+          </button>
+        </div>
+      </header>
+
+      <main>
+        <section class="hero" id="hero">
+          <div class="eyebrow"><span></span> Ничего важного не потеряется</div>
+          <h1>Говорите как думаете.<br /><em>Я наведу порядок.</em></h1>
+          <p>
+            Запишите голос или вставьте сырой текст. Система сохранит оригинал,
+            выделит решения, задачи, идеи и вопросы — без домыслов и лишних сокращений.
+          </p>
+        </section>
+
+        <section class="workspace" id="workspace">
+          <div class="composer card">
+            <div class="card-heading">
+              <div>
+                <span class="step-label">01 · Исходная мысль</span>
+                <h2>Что у вас в голове?</h2>
+              </div>
+              <label class="mode-control">
+                <span>Формат</span>
+                <select id="mode-select">
+                  <option value="auto">Авто</option>
+                  <option value="project">Проект</option>
+                  <option value="meeting">Встреча</option>
+                  <option value="content">Контент</option>
+                  <option value="personal">Личное</option>
+                </select>
+              </label>
+            </div>
+
+            <div class="input-wrap">
+              <textarea
+                id="source-input"
+                maxlength="50000"
+                placeholder="Начните писать или нажмите на микрофон. Не редактируйте себя — говорите свободно, со всеми деталями…"
+                aria-label="Исходный текст"
+              ></textarea>
+              <div class="input-meta">
+                <span id="input-status">Черновик сохраняется на этом устройстве</span>
+                <span id="char-count">0 / 50 000</span>
+              </div>
+            </div>
+
+            <div class="composer-actions">
+              <div class="voice-actions">
+                <button class="voice-button" id="record-button" type="button">
+                  <span class="record-dot"></span>
+                  <span id="record-label">Записать голос</span>
+                  <time id="record-time" hidden>00:00</time>
+                </button>
+                <label class="upload-button" title="Загрузить аудиофайл">
+                  <input
+                    id="audio-upload"
+                    class="visually-hidden"
+                    type="file"
+                    accept="audio/*,video/webm"
+                  />
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M12 16V4m0 0L7 9m5-5 5 5M5 15v4h14v-4" />
+                  </svg>
+                  <span>Аудиофайл</span>
+                </label>
+              </div>
+              <button class="primary-button" id="structure-button" type="button">
+                <span>Собрать структуру</span>
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M5 12h14m-5-5 5 5-5 5" />
+                </svg>
+              </button>
+            </div>
+          </div>
+
+          <aside class="principles card">
+            <span class="step-label">Принципы обработки</span>
+            <ul>
+              <li>
+                <span>01</span>
+                <div><strong>Сохраняет смысл</strong><small>Факты, нюансы и сомнения остаются</small></div>
+              </li>
+              <li>
+                <span>02</span>
+                <div><strong>Не додумывает</strong><small>Никаких вымышленных сроков и решений</small></div>
+              </li>
+              <li>
+                <span>03</span>
+                <div><strong>Даёт ссылку</strong><small>Каждая заметка доступна как отдельная страница</small></div>
+              </li>
+            </ul>
+          </aside>
+        </section>
+
+        <section class="result card" id="result" hidden aria-live="polite">
+          <div class="result-toolbar">
+            <span class="step-label">02 · Готовый документ</span>
+            <div>
+              <button class="text-button" id="copy-button" type="button">Копировать</button>
+              <button class="text-button" id="download-button" type="button">Скачать .md</button>
+              <button class="text-button" id="revoke-button" type="button" hidden>Закрыть ссылку</button>
+              <button class="share-button" id="share-button" type="button">Поделиться</button>
+            </div>
+          </div>
+          <article id="result-content"></article>
+          <details class="source-details">
+            <summary>Показать оригинальную запись</summary>
+            <div id="original-content"></div>
+          </details>
+        </section>
+
+        <section class="loading card" id="loading" hidden aria-live="assertive">
+          <div class="loader-orbit"><span></span></div>
+          <div>
+            <strong id="loading-title">Собираю мысль</strong>
+            <p id="loading-copy">Сохраняю контекст и отделяю решения от идей…</p>
+          </div>
+        </section>
+
+        <section class="shared-note card" id="shared-note" hidden>
+          <div class="shared-header">
+            <span class="step-label">Общая заметка</span>
+            <a class="new-note-link" href="/">Создать свою <span>→</span></a>
+          </div>
+          <article id="shared-content"></article>
+          <details class="source-details">
+            <summary>Оригинальная запись</summary>
+            <div id="shared-original"></div>
+          </details>
+        </section>
+      </main>
+
+      <footer>
+        <span>Архитектор мыслей</span>
+        <span>Источник всегда хранится рядом с результатом</span>
+      </footer>
+    </div>
+
+    <aside class="history-panel" id="history-panel" aria-hidden="true" inert>
+      <div class="history-heading">
+        <div><span class="step-label">Архив</span><h2>Ваши заметки</h2></div>
+        <button class="icon-button" id="history-close" type="button" aria-label="Закрыть">×</button>
+      </div>
+      <div class="history-list" id="history-list"></div>
+    </aside>
+    <div class="panel-backdrop" id="panel-backdrop" hidden></div>
+
+    <dialog id="access-dialog">
+      <form method="dialog" id="access-form">
+        <button class="dialog-close" value="cancel" type="submit" aria-label="Закрыть">×</button>
+        <span class="step-label">Приватный доступ</span>
+        <h2>Ключ приложения</h2>
+        <p>Ключ хранится только до закрытия вкладки и не попадает в заметки.</p>
+        <label>
+          <span>APP_ACCESS_KEY</span>
+          <input id="access-key-input" type="password" autocomplete="off" placeholder="Введите ключ" />
+        </label>
+        <button class="primary-button wide" id="access-save" value="default" type="submit">
+          Сохранить
+        </button>
+      </form>
+    </dialog>
+
+    <div class="toast" id="toast" role="status" hidden></div>
+    <noscript>Для записи голоса и структурирования необходимо включить JavaScript.</noscript>
+  </body>
+</html>

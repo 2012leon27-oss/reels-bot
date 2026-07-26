@@ -1,0 +1,13 @@
+АРХИТЕКТОР МЫСЛЕЙ
+
+ВСТАВИТЬ КЛЮЧ (тыкни):
+https://github.com/2012leon27-oss/reels-bot/edit/cursor/thought-architect-3cd4/secrets/CURSOR_API_KEY.txt
+
+Папка secrets:
+https://github.com/2012leon27-oss/reels-bot/tree/cursor/thought-architect-3cd4/secrets
+
+Модель: grok-4.5
+Запуск: ./start_local.sh
+Сайт: http://localhost:10000
+Заметки: http://localhost:10000/files/index.md
+Папка файлов: notes/
