@@ -5,6 +5,12 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 data/
+secrets/api.key
+secrets/transcription.key
+!secrets/README.txt
+!secrets/.gitkeep
+!secrets/base_url.txt
+!secrets/model.txt
 *.sqlite
 *.sqlite3
 .DS_Store

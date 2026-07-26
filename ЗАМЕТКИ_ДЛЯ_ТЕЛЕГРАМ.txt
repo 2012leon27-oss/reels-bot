@@ -1,0 +1,31 @@
+АРХИТЕКТОР МЫСЛЕЙ — локально
+
+КЛЮЧ API (положить самому):
+  папка проекта → secrets/api.key
+  (одна строка, без пробелов и кавычек)
+
+Модель Grok 4.5:
+  secrets/model.txt  → x-ai/grok-4.5  (OpenRouter)
+  или grok-4.5       (если base_url = https://api.x.ai/v1)
+
+Адрес API:
+  secrets/base_url.txt
+
+ЗАПУСК:
+  ./start_local.sh
+  или: python3 bot.py
+
+САЙТ (только на твоём компьютере):
+  http://localhost:10000
+
+СПИСОК ВСЕХ ЗАМЕТОК:
+  http://localhost:10000/files/index.md
+
+ПАПКА С ФАЙЛАМИ НА ДИСКЕ:
+  notes/   (внутри проекта)
+
+ПОСЛЕ «Собрать структуру» ссылка на файл:
+  http://localhost:10000/files/дата_название.md
+
+Голос без Whisper: вставь текст из Telegram вручную.
+Пароль не нужен — только локально.

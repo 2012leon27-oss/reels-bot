@@ -38,9 +38,17 @@ class AIResponseError(RuntimeError):
 def _client(api_key: str, base_url: str) -> AsyncOpenAI:
     if not api_key:
         raise AIConfigurationError(
-            "AI API key is not configured. Set GROQ_API_KEY or AI_API_KEY."
+            "API key is missing. Put your key in secrets/api.key"
         )
-    return AsyncOpenAI(api_key=api_key, base_url=base_url)
+    default_headers = None
+    if "openrouter.ai" in base_url:
+        default_headers = {
+            "HTTP-Referer": "http://localhost:10000",
+            "X-Title": "Thought Architect",
+        }
+    return AsyncOpenAI(
+        api_key=api_key, base_url=base_url, default_headers=default_headers
+    )
 
 
 def _as_string_list(value: Any) -> list[str]:

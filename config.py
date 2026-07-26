@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
+ROOT = Path(__file__).resolve().parent
+SECRETS_DIR = ROOT / "secrets"
 
 
 def _first_env(*names: str, default: str = "") -> str:
@@ -16,6 +20,13 @@ def _first_env(*names: str, default: str = "") -> str:
         if value:
             return value
     return default
+
+
+def _read_secret_file(name: str) -> str:
+    path = SECRETS_DIR / name
+    if path.is_file():
+        return path.read_text(encoding="utf-8").strip()
+    return ""
 
 
 def _int_list(value: str) -> tuple[int, ...]:
@@ -37,24 +48,30 @@ class Settings:
     database_url: str = _first_env("DATABASE_URL")
     sqlite_path: str = _first_env("SQLITE_PATH", default="data/thoughts.db")
 
-    # GROK_API_KEY and GROG_API_KEY are accepted only for backwards
-    # compatibility with previous deployments of this repository.
     ai_api_key: str = _first_env(
-        "AI_API_KEY", "GROQ_API_KEY", "GROK_API_KEY", "GROG_API_KEY"
+        "AI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "GROQ_API_KEY",
+        "GROK_API_KEY",
+        "GROG_API_KEY",
+        "XAI_API_KEY",
+    ) or _read_secret_file("api.key")
+    ai_base_url: str = (
+        _first_env("AI_BASE_URL")
+        or _read_secret_file("base_url.txt")
+        or "https://openrouter.ai/api/v1"
     )
-    ai_base_url: str = _first_env(
-        "AI_BASE_URL", default="https://api.groq.com/openai/v1"
-    )
-    ai_model: str = _first_env(
-        "AI_MODEL", "GROQ_MODEL", "GROK_MODEL", "GROG_MODEL",
-        default="llama-3.3-70b-versatile",
+    ai_model: str = (
+        _first_env("AI_MODEL", "GROQ_MODEL", "GROK_MODEL", "GROG_MODEL")
+        or _read_secret_file("model.txt")
+        or "x-ai/grok-4.5"
     )
     transcription_api_key: str = _first_env(
         "TRANSCRIPTION_API_KEY",
         "GROQ_API_KEY",
         "GROK_API_KEY",
         "GROG_API_KEY",
-    )
+    ) or _read_secret_file("transcription.key")
     transcription_base_url: str = _first_env(
         "TRANSCRIPTION_BASE_URL", default="https://api.groq.com/openai/v1"
     )
@@ -70,6 +87,7 @@ class Settings:
     max_audio_bytes: int = int(
         _first_env("MAX_AUDIO_BYTES", default=str(25 * 1024 * 1024))
     )
+    notes_output_dir: str = _first_env("NOTES_OUTPUT_DIR", default="notes")
 
     @property
     def production(self) -> bool:

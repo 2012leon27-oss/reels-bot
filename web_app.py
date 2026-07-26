@@ -33,6 +33,7 @@ from grok_client import (
     structure_thoughts,
     transcribe_audio,
 )
+from note_export import export_note, notes_dir_path
 
 logger = logging.getLogger(__name__)
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -115,7 +116,16 @@ def _with_links(note: dict[str, Any], request: web.Request) -> dict[str, Any]:
     result.pop("owner_id", None)
     result["share_enabled"] = bool(result.get("share_enabled"))
     result["share_source"] = bool(result.get("share_source"))
+    if result.get("file_name"):
+        result["file_url"] = f"{_base_url(request)}/files/{result['file_name']}"
+        result["index_url"] = f"{_base_url(request)}/files/index.md"
     return result
+
+
+def _export_note_files(note: dict[str, Any]) -> dict[str, Any]:
+    paths = export_note(note)
+    note.update(paths)
+    return note
 
 
 async def index(request: web.Request) -> web.FileResponse:
@@ -178,6 +188,7 @@ async def structure(request: web.Request) -> web.Response:
         structured_markdown=markdown,
         mode=mode,
     )
+    note = _export_note_files(note)
     return web.json_response(_with_links(note, request), status=201)
 
 
@@ -344,6 +355,7 @@ def create_app() -> web.Application:
     app.router.add_post("/api/notes/{note_id}/share", update_sharing)
     app.router.add_delete("/api/notes/{note_id}", remove_note)
     app.router.add_get("/api/public/{share_id}", public_note)
+    app.router.add_static("/files/", str(notes_dir_path()), show_index=True)
     app.router.add_static("/static/", STATIC_ROOT, append_version=True)
     app.on_startup.append(on_startup)
     app.on_cleanup.append(on_cleanup)

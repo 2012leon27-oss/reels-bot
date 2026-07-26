@@ -277,6 +277,7 @@
       state.retryAction = null;
       localStorage.removeItem("thought-architect-draft");
       renderResult(note);
+      if (note.file_url) showToast(`Файл: ${note.file_url}`);
     } catch (error) {
       if (error.status !== 401) state.retryAction = null;
       showToast(error.message);
